@@ -384,6 +384,7 @@ HTML = r"""<!doctype html>
           <span id="skinSwatch" class="swatch"></span>
           <span id="skinText">未吸取目标肤色</span>
         </div>
+        <button id="autoColorAlignBtn" style="width:100%; margin-top:10px;">自动对齐肤色</button>
         <label>眉毛保护 <span class="value" id="protectValue">90%</span></label>
         <input id="protectDark" type="range" min="0" max="100" value="90" />
         <label>输出留边 <span class="value" id="padValue">0</span></label>
@@ -1099,6 +1100,15 @@ HTML = r"""<!doctype html>
     }
     document.getElementById('moveTargetBtn').onclick = () => setTargetTool('move');
     document.getElementById('eyedropperBtn').onclick = () => setTargetTool('eyedropper');
+    document.getElementById('autoColorAlignBtn').onclick = () => {
+      setVal('colorMatch', 85);
+      setVal('skinTint', 82);
+      setVal('protectDark', 95);
+      setVal('opacity', 100);
+      redrawTarget({ fast: true });
+      schedulePreview();
+      setStatus('已启用较强肤色对齐，正在更新精细预览。');
+    };
     document.getElementById('primaryPatchBtn').onclick = () => setActivePatch('primary');
     document.getElementById('secondaryPatchBtn').onclick = () => setActivePatch('secondary');
     document.getElementById('copyPatchBtn').onclick = () => {
@@ -1879,15 +1889,20 @@ def color_match_patch(
     out_rgb = cv2.cvtColor(out_lab, cv2.COLOR_LAB2RGB).astype(np.float32)
 
     # Make imported skin disappear into the target while keeping dark brow strokes.
-    # This is closer to the PS workflow for eyebrow transfer than plain color shifting.
+    # Use a smoothed target skin field so old target brow texture is not copied back
+    # too strongly, but source-side orange/gray skin does not remain visible.
     alpha_frac = alpha.astype(np.float32) / 255.0
     skin_fill = estimate_skin_fill(target_rgb, alpha_mask, skin_weight, skin_sample)
     skin_fill_rgb = np.zeros_like(target_rgb, dtype=np.float32)
     skin_fill_rgb[:, :] = skin_fill
+    target_smooth = cv2.GaussianBlur(target_rgb.astype(np.float32), (0, 0), sigmaX=3.0, sigmaY=3.0)
+    skin_target_rgb = target_smooth * 0.65 + skin_fill_rgb * 0.35
     cover_weight = (old_brow_cover * skin_weight * alpha_frac)[..., None]
-    covered_target = target_rgb.astype(np.float32) * (1.0 - cover_weight) + skin_fill_rgb * cover_weight
+    covered_target = skin_target_rgb * (1.0 - cover_weight) + skin_fill_rgb * cover_weight
 
-    skin_fade = (skin_tint * skin_weight * alpha_frac)[..., None]
+    skin_fade_strength = np.clip(skin_tint * 1.15 + strength * 0.25, 0.0, 1.0)
+    skin_fade_weight = smoothstep(0.12, 0.72, skin_weight)
+    skin_fade = (skin_fade_strength * skin_fade_weight * alpha_frac)[..., None]
     out_rgb = out_rgb * (1.0 - skin_fade) + covered_target * skin_fade
     return np.clip(out_rgb, 0, 255).astype(np.uint8)
 
