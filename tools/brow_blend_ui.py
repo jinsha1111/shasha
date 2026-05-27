@@ -284,6 +284,10 @@ HTML = r"""<!doctype html>
         </div>
         <label>浏览器选择来源</label>
         <input id="sourceFile" type="file" accept="image/*" />
+        <div class="row" style="margin-top:8px;">
+          <button id="alignSourceColorBtn">对齐目标肤色</button>
+          <button id="restoreSourceColorBtn">还原来源</button>
+        </div>
       </div>
       <div class="card">
         <h2>来源选区</h2>
@@ -454,10 +458,12 @@ HTML = r"""<!doctype html>
     let sourceData = '';
     let targetData = '';
     let patchData = '';
+    let sourceOriginalData = '';
     let targetPreviewImage = null;
     let sourceName = 'source';
     let targetName = 'target';
     let patchName = 'patch';
+    let sourceOriginalName = 'source';
     let sourceTool = 'brush';
     let sourceDrawing = false;
     let lastPoint = null;
@@ -825,22 +831,48 @@ HTML = r"""<!doctype html>
       targetHitCtx.restore();
     }
 
+    function updateSourceImage(dataUrl, name, options = {}) {
+      const img = new Image();
+      img.onload = () => {
+        const oldMask = maskCanvas.width && maskCanvas.height
+          ? maskCtx.getImageData(0, 0, maskCanvas.width, maskCanvas.height)
+          : null;
+        const canKeepMask = !!oldMask && oldMask.width === img.naturalWidth && oldMask.height === img.naturalHeight;
+        sourceImage = img;
+        sourceData = dataUrl;
+        sourceName = name || 'source';
+        if (!options.keepOriginal) {
+          sourceOriginalData = dataUrl;
+          sourceOriginalName = name || 'source';
+        }
+        maskCanvas.width = img.naturalWidth;
+        maskCanvas.height = img.naturalHeight;
+        maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
+        if (options.keepMask && canKeepMask) {
+          maskCtx.putImageData(oldMask, 0, 0);
+        } else {
+          undoStack = [];
+          maskBBoxCache = null;
+        }
+        if (options.keepMask && canKeepMask) maskBBoxCache = null;
+        invalidatePreview();
+        resultImg.removeAttribute('src');
+        sourceInfo.textContent = `${img.naturalWidth} x ${img.naturalHeight}${options.aligned ? ' · 已对齐' : ''}`;
+        redrawSource();
+        redrawTarget({ fast: true });
+        if (getMaskBBox()) schedulePreview();
+        setStatus(options.status || (options.aligned ? '来源图已按目标肤色对齐。' : '图片已载入。'));
+      };
+      img.src = dataUrl;
+    }
+
     function loadImageData(dataUrl, name, kind) {
       const img = new Image();
       img.onload = () => {
         if (kind === 'source') {
-          sourceImage = img;
-          sourceData = dataUrl;
-          sourceName = name || 'source';
-          maskCanvas.width = img.naturalWidth;
-          maskCanvas.height = img.naturalHeight;
-          maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
-          maskBBoxCache = null;
-          invalidatePreview();
-          undoStack = [];
-          sourceInfo.textContent = `${img.naturalWidth} x ${img.naturalHeight}`;
-          redrawSource();
-          redrawTarget({ fast: true });
+          img.onload = null;
+          updateSourceImage(dataUrl, name, { keepOriginal: false, keepMask: false });
+          return;
         } else if (kind === 'target') {
           targetImage = img;
           targetData = dataUrl;
@@ -902,6 +934,45 @@ HTML = r"""<!doctype html>
       resultImg.removeAttribute('src');
       redrawTarget({ fast: true });
       setStatus('已切回来源图选区模式。');
+    };
+    document.getElementById('alignSourceColorBtn').onclick = async () => {
+      if (!sourceData || !targetData) {
+        setStatus('来源图和目标图都要先载入，才能对齐肤色。');
+        return;
+      }
+      setStatus('正在把来源图肤色对齐到目标图...');
+      const resp = await fetch('/api/align_source_color', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          source_data: sourceOriginalData || sourceData,
+          target_data: targetData,
+          source_name: sourceOriginalName || sourceName,
+          strength: 0.92
+        })
+      });
+      const data = await resp.json();
+      if (!resp.ok) {
+        setStatus(data.detail || '来源图肤色对齐失败');
+        return;
+      }
+      updateSourceImage(data.data_url, data.name, {
+        keepOriginal: true,
+        keepMask: true,
+        aligned: true,
+        status: `来源图已对齐目标肤色：${data.width} x ${data.height}`
+      });
+    };
+    document.getElementById('restoreSourceColorBtn').onclick = () => {
+      if (!sourceOriginalData) {
+        setStatus('还没有可还原的原始来源图。');
+        return;
+      }
+      updateSourceImage(sourceOriginalData, sourceOriginalName, {
+        keepOriginal: true,
+        keepMask: true,
+        status: '已还原原始来源图。'
+      });
     };
     document.getElementById('fitSource').onclick = () => { setVal('sourceZoom', 100); redrawSource(); };
     document.getElementById('fitTarget').onclick = () => redrawTarget();
@@ -1487,6 +1558,13 @@ class PathRequest(BaseModel):
     path: str
 
 
+class ColorAlignRequest(BaseModel):
+    source_data: str
+    target_data: str
+    source_name: str = "source"
+    strength: float = 0.92
+
+
 class PatchPlacement(BaseModel):
     name: str = "patch"
     x: float = 0
@@ -1816,6 +1894,100 @@ def smoothstep(edge0: float, edge1: float, value):
     return t * t * (3.0 - 2.0 * t)
 
 
+def central_region_mask(shape, x_margin=0.08, y_margin=0.04):
+    h, w = shape[:2]
+    mask = np.zeros((h, w), dtype=bool)
+    x1 = int(round(w * x_margin))
+    x2 = int(round(w * (1.0 - x_margin)))
+    y1 = int(round(h * y_margin))
+    y2 = int(round(h * (1.0 - y_margin)))
+    mask[y1:y2, x1:x2] = True
+    return mask
+
+
+def skin_alignment_stats(rgb: np.ndarray):
+    rgb_u8 = rgb.astype(np.uint8)
+    lab = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2LAB).astype(np.float32)
+    hsv = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2HSV)
+    gray = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    sat = hsv[:, :, 1].astype(np.float32)
+    a_chan = lab[:, :, 1]
+    b_chan = lab[:, :, 2]
+    center = central_region_mask(rgb.shape)
+
+    chroma_like_skin = (sat > 5) | (a_chan > 131) | (b_chan > 132)
+    valid = center & (gray > 45) & (gray < 245) & (sat < 165) & chroma_like_skin
+    if np.count_nonzero(valid) < 250:
+        valid = (gray > 45) & (gray < 245) & (sat < 165) & chroma_like_skin
+    if np.count_nonzero(valid) < 250:
+        valid = center & (gray > 45) & (gray < 245)
+    if np.count_nonzero(valid) < 50:
+        valid = gray > 20
+
+    values = gray[valid]
+    if values.size >= 50:
+        low = np.percentile(values, 24)
+        high = np.percentile(values, 94)
+        trimmed = valid & (gray >= low) & (gray <= high)
+        if np.count_nonzero(trimmed) >= 50:
+            valid = trimmed
+
+    selected = lab[valid]
+    if selected.size < 150:
+        selected = lab.reshape(-1, 3)
+        valid = np.ones(gray.shape, dtype=bool)
+
+    mean = np.median(selected, axis=0)
+    lo = np.percentile(selected, 16, axis=0)
+    hi = np.percentile(selected, 84, axis=0)
+    std = np.maximum((hi - lo) / 2.0, 4.0)
+    return mean.astype(np.float32), std.astype(np.float32), valid
+
+
+def source_skin_alignment_weight(rgb: np.ndarray, skin_mask: np.ndarray):
+    rgb_u8 = rgb.astype(np.uint8)
+    hsv = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2HSV)
+    gray = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    sat = hsv[:, :, 1].astype(np.float32)
+    selected = gray[skin_mask]
+    if selected.size < 50:
+        selected = gray.reshape(-1)
+    low = np.percentile(selected, 18)
+    mid = np.percentile(selected, 55)
+    high = np.percentile(selected, 90)
+
+    luminance_weight = smoothstep(low - 8, mid + 24, gray)
+    bright_limit = 1.0 - smoothstep(high + 10, 255, gray)
+    saturation_limit = 1.0 - smoothstep(145, 210, sat)
+    mask_weight = cv2.GaussianBlur(skin_mask.astype(np.float32), (0, 0), sigmaX=9.0, sigmaY=9.0)
+    weight = np.maximum(mask_weight, luminance_weight * bright_limit * saturation_limit)
+
+    # Keep eyebrow and eyelash strokes from being recolored with the skin.
+    dark_protect = 1.0 - smoothstep(low - 18, low + 42, gray)
+    weight = weight * (1.0 - dark_protect * 0.9)
+    return np.clip(weight, 0.0, 1.0)
+
+
+def align_source_to_target_skin(source_rgba: np.ndarray, target_rgba: np.ndarray, strength: float = 0.92):
+    strength = max(0.0, min(float(strength), 1.0))
+    source_rgb = source_rgba[:, :, :3].astype(np.uint8)
+    target_rgb = target_rgba[:, :, :3].astype(np.uint8)
+    src_mean, src_std, src_skin_mask = skin_alignment_stats(source_rgb)
+    dst_mean, dst_std, _ = skin_alignment_stats(target_rgb)
+
+    source_lab = cv2.cvtColor(source_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    scale = np.clip(dst_std / np.maximum(src_std, 1e-6), 0.72, 1.32)
+    matched_lab = (source_lab - src_mean.reshape(1, 1, 3)) * scale.reshape(1, 1, 3) + dst_mean.reshape(1, 1, 3)
+    matched_lab = np.clip(matched_lab, 0, 255).astype(np.uint8)
+    matched_rgb = cv2.cvtColor(matched_lab, cv2.COLOR_LAB2RGB).astype(np.float32)
+
+    weight = source_skin_alignment_weight(source_rgb, src_skin_mask) * strength
+    out_rgb = source_rgb.astype(np.float32) * (1.0 - weight[..., None]) + matched_rgb * weight[..., None]
+    out = source_rgba.copy()
+    out[:, :, :3] = np.clip(out_rgb, 0, 255).astype(np.uint8)
+    return out
+
+
 def estimate_skin_fill(target_rgb, alpha_mask, skin_weight, skin_sample=None):
     if skin_sample:
         return np.array(skin_sample[:3], dtype=np.float32)
@@ -2112,6 +2284,21 @@ def load_path(req: PathRequest):
     if not path.exists() or not path.is_file():
         raise HTTPException(status_code=404, detail=f"文件不存在: {path}")
     return data_url_from_image(path)
+
+
+@app.post("/api/align_source_color")
+def align_source_color(req: ColorAlignRequest):
+    source = np.array(decode_data_url(req.source_data))
+    target = np.array(decode_data_url(req.target_data))
+    result = Image.fromarray(align_source_to_target_skin(source, target, req.strength), "RGBA")
+    source_stem = Path(req.source_name or "source").stem
+    name = re.sub(r"[\\/:*?\"<>|]+", "_", f"{source_stem}_aligned_to_target").strip() + ".png"
+    return {
+        "name": name,
+        "width": result.width,
+        "height": result.height,
+        "data_url": image_to_data_url(result),
+    }
 
 
 @app.post("/api/blend")
