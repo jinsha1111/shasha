@@ -403,6 +403,16 @@ HTML = r"""<!doctype html>
 
       <div class="card">
         <h2>贴片库</h2>
+        <label>载入已保存贴片</label>
+        <input id="patchPath" type="text" value="/media/jinsha/娱乐1/眉毛/眉毛贴片库/野生眉1.png" />
+        <div class="row" style="margin-top:8px;">
+          <button id="loadPatchPath">打开贴片</button>
+          <button id="clearLoadedPatch">不用贴片</button>
+        </div>
+        <label>浏览器选择贴片</label>
+        <input id="patchFile" type="file" accept="image/*" />
+        <div class="status" id="patchInfo" style="margin-top:8px;">未载入贴片，当前使用来源图选区。</div>
+        <hr style="border:0; border-top:1px solid var(--line); margin:12px 0;" />
         <label>贴片模式</label>
         <select id="patchMode">
           <option value="hair_only">只保留眉毛线条</option>
@@ -435,14 +445,18 @@ HTML = r"""<!doctype html>
     const statusEl = document.getElementById('status');
     const sourceInfo = document.getElementById('sourceInfo');
     const targetInfo = document.getElementById('targetInfo');
+    const patchInfo = document.getElementById('patchInfo');
 
     let sourceImage = null;
     let targetImage = null;
+    let patchImage = null;
     let sourceData = '';
     let targetData = '';
+    let patchData = '';
     let targetPreviewImage = null;
     let sourceName = 'source';
     let targetName = 'target';
+    let patchName = 'patch';
     let sourceTool = 'brush';
     let sourceDrawing = false;
     let lastPoint = null;
@@ -735,13 +749,18 @@ HTML = r"""<!doctype html>
     }
 
     function drawFastPatchPreview() {
-      if (!sourceImage || !targetImage) return;
-      const bbox = livePatchBBox();
-      if (!bbox) return;
+      if (!targetImage) return;
       const opacity = Number(document.getElementById('opacity').value) / 100;
-      const feather = Number(document.getElementById('feather').value);
-      const contract = Number(document.getElementById('contract').value);
-      const alphaCanvas = makeInnerAlphaCanvas(bbox, feather, contract);
+      const loadedPatch = patchImage;
+      const bbox = loadedPatch ? null : livePatchBBox();
+      if (!loadedPatch && (!sourceImage || !bbox)) return;
+      const alphaCanvas = loadedPatch ? null : makeInnerAlphaCanvas(
+        bbox,
+        Number(document.getElementById('feather').value),
+        Number(document.getElementById('contract').value)
+      );
+      const patchW = loadedPatch ? loadedPatch.naturalWidth : bbox.w;
+      const patchH = loadedPatch ? loadedPatch.naturalHeight : bbox.h;
       for (const [name, p] of Object.entries(patches)) {
         if (!p.enabled) continue;
         const x = p.xPct / 100 * targetCanvas.width;
@@ -754,14 +773,18 @@ HTML = r"""<!doctype html>
         targetCtx.scale(p.flip ? -scale : scale, scale);
 
         const patch = document.createElement('canvas');
-        patch.width = bbox.w;
-        patch.height = bbox.h;
+        patch.width = patchW;
+        patch.height = patchH;
         const patchCtx = patch.getContext('2d');
-        patchCtx.drawImage(sourceImage, bbox.x, bbox.y, bbox.w, bbox.h, 0, 0, bbox.w, bbox.h);
+        if (loadedPatch) {
+          patchCtx.drawImage(loadedPatch, 0, 0, patchW, patchH);
+        } else {
+          patchCtx.drawImage(sourceImage, bbox.x, bbox.y, bbox.w, bbox.h, 0, 0, bbox.w, bbox.h);
 
-        patchCtx.globalCompositeOperation = 'destination-in';
-        patchCtx.drawImage(alphaCanvas, 0, 0);
-        targetCtx.drawImage(patch, -bbox.w / 2, -bbox.h / 2);
+          patchCtx.globalCompositeOperation = 'destination-in';
+          patchCtx.drawImage(alphaCanvas, 0, 0);
+        }
+        targetCtx.drawImage(patch, -patchW / 2, -patchH / 2);
         targetCtx.restore();
       }
     }
@@ -817,7 +840,7 @@ HTML = r"""<!doctype html>
           sourceInfo.textContent = `${img.naturalWidth} x ${img.naturalHeight}`;
           redrawSource();
           redrawTarget({ fast: true });
-        } else {
+        } else if (kind === 'target') {
           targetImage = img;
           targetData = dataUrl;
           targetPreviewImage = null;
@@ -833,9 +856,18 @@ HTML = r"""<!doctype html>
           patches.secondary.yPct = 35;
           setActivePatch('primary');
           redrawTarget({ fast: true });
+        } else if (kind === 'patch') {
+          patchImage = img;
+          patchData = dataUrl;
+          patchName = name || 'patch';
+          patchInfo.innerHTML = `<strong>已载入贴片：</strong>${patchName}<br>${img.naturalWidth} x ${img.naturalHeight}`;
+          resultImg.removeAttribute('src');
+          hasPreview = false;
+          redrawTarget({ fast: true });
+          schedulePreview();
         }
         hasPreview = false;
-        resultImg.removeAttribute('src');
+        if (kind !== 'patch') resultImg.removeAttribute('src');
         setStatus('图片已载入。');
       };
       img.src = dataUrl;
@@ -859,6 +891,17 @@ HTML = r"""<!doctype html>
 
     document.getElementById('loadSourcePath').onclick = () => loadPath(document.getElementById('sourcePath').value.trim(), 'source');
     document.getElementById('loadTargetPath').onclick = () => loadPath(document.getElementById('targetPath').value.trim(), 'target');
+    document.getElementById('loadPatchPath').onclick = () => loadPath(document.getElementById('patchPath').value.trim(), 'patch');
+    document.getElementById('clearLoadedPatch').onclick = () => {
+      patchImage = null;
+      patchData = '';
+      patchName = 'patch';
+      patchInfo.textContent = '未载入贴片，当前使用来源图选区。';
+      hasPreview = false;
+      resultImg.removeAttribute('src');
+      redrawTarget({ fast: true });
+      setStatus('已切回来源图选区模式。');
+    };
     document.getElementById('fitSource').onclick = () => { setVal('sourceZoom', 100); redrawSource(); };
     document.getElementById('fitTarget').onclick = () => redrawTarget();
 
@@ -871,6 +914,7 @@ HTML = r"""<!doctype html>
     }
     document.getElementById('sourceFile').addEventListener('change', ev => readFileInput(ev.target, 'source'));
     document.getElementById('targetFile').addEventListener('change', ev => readFileInput(ev.target, 'target'));
+    document.getElementById('patchFile').addEventListener('change', ev => readFileInput(ev.target, 'patch'));
 
     function sourcePoint(ev) {
       const rect = sourcePaintCanvas.getBoundingClientRect();
@@ -1196,6 +1240,14 @@ HTML = r"""<!doctype html>
       document.getElementById(id).addEventListener('change', onParamChange);
     }
 
+    function hasPatchSource() {
+      return !!patchData || (!!sourceImage && !!getMaskBBox());
+    }
+
+    function sourceMaskData() {
+      return maskCanvas.width && maskCanvas.height ? maskCanvas.toDataURL('image/png') : '';
+    }
+
     function payload(save) {
       syncPatchFromControls();
       const placements = [];
@@ -1212,7 +1264,9 @@ HTML = r"""<!doctype html>
       }
       return {
         source_data: sourceData,
-        source_mask_data: maskCanvas.toDataURL('image/png'),
+        source_mask_data: sourceMaskData(),
+        patch_data: patchData,
+        patch_name: patchName,
         target_data: targetData,
         source_name: sourceName,
         target_name: targetName,
@@ -1236,7 +1290,7 @@ HTML = r"""<!doctype html>
     function patchPayload(save) {
       return {
         source_data: sourceData,
-        source_mask_data: maskCanvas.toDataURL('image/png'),
+        source_mask_data: sourceMaskData(),
         source_name: sourceName,
         patch_mode: document.getElementById('patchMode').value,
         feather: Number(document.getElementById('feather').value),
@@ -1254,7 +1308,9 @@ HTML = r"""<!doctype html>
       const p = activePatchData();
       return {
         source_data: sourceData,
-        source_mask_data: maskCanvas.toDataURL('image/png'),
+        source_mask_data: sourceMaskData(),
+        patch_data: patchData,
+        patch_name: patchName,
         target_data: targetData,
         source_name: sourceName,
         target_name: targetName,
@@ -1283,12 +1339,12 @@ HTML = r"""<!doctype html>
     }
 
     async function process(save) {
-      if (!sourceImage || !targetImage) {
-        setStatus('来源图和目标图都要先载入。');
+      if (!targetImage) {
+        setStatus('请先载入目标图。');
         return;
       }
-      if (!getMaskBBox()) {
-        setStatus('来源选区为空，请先在来源图上涂出眉毛区域。');
+      if (!hasPatchSource()) {
+        setStatus('请先载入已保存贴片，或在来源图上涂出眉毛区域。');
         return;
       }
       if (processBusy && !save) {
@@ -1364,12 +1420,12 @@ HTML = r"""<!doctype html>
     }
 
     async function exportTunedPatch(save) {
-      if (!sourceImage || !targetImage) {
-        setStatus('来源图和目标图都要先载入，才能保存当前调好贴片。');
+      if (!targetImage) {
+        setStatus('请先载入目标图，才能保存当前调好贴片。');
         return;
       }
-      if (!getMaskBBox()) {
-        setStatus('来源选区为空，请先在来源图上涂出眉毛区域。');
+      if (!hasPatchSource()) {
+        setStatus('请先载入已保存贴片，或在来源图上涂出眉毛区域。');
         return;
       }
       setStatus('正在保存当前调好贴片...');
@@ -1397,7 +1453,7 @@ HTML = r"""<!doctype html>
     }
 
     function schedulePreview() {
-      if (!sourceImage || !targetImage || !getMaskBBox()) return;
+      if (!targetImage || !hasPatchSource()) return;
       clearTimeout(previewTimer);
       previewTimer = setTimeout(() => process(false), 350);
     }
@@ -1434,6 +1490,8 @@ class BlendRequest(BaseModel):
     source_data: str
     source_mask_data: str
     target_data: str
+    patch_data: str = ""
+    patch_name: str = "patch"
     source_name: str = "source"
     target_name: str = "target"
     patches: list[PatchPlacement] = Field(default_factory=list)
@@ -1894,18 +1952,8 @@ def poisson_blend(target_rgba, source_canvas, req: BlendRequest):
 
 
 def build_blend(req: BlendRequest):
-    source = np.array(decode_data_url(req.source_data))
     target = np.array(decode_data_url(req.target_data))
-    mask_image = decode_data_url(req.source_mask_data)
-    source_mask = normalize_mask(mask_image, (source.shape[1], source.shape[0]))
-    source_mask = make_protected_soft_patch_mask(
-        source,
-        source_mask,
-        req.contract,
-        req.feather,
-        req.protect_dark,
-    )
-    base_patch = crop_patch(source, source_mask, pad=max(8, int(req.pad) + 12))
+    base_patch = build_base_patch(req)
     placements = req.patches or [
         PatchPlacement(
             name="patch",
@@ -1963,6 +2011,30 @@ def safe_tuned_patch_name(name: str, source_name: str, target_name: str):
     return stem + ".png"
 
 
+def build_base_patch(req: BlendRequest):
+    if req.patch_data:
+        patch = np.array(decode_data_url(req.patch_data))
+        alpha = patch[:, :, 3]
+        if np.count_nonzero(alpha > 2) < 20:
+            raise HTTPException(status_code=400, detail="载入的贴片没有有效透明通道")
+        patch[:, :, :3][alpha == 0] = 0
+        return patch
+
+    if not req.source_data or not req.source_mask_data:
+        raise HTTPException(status_code=400, detail="请先载入贴片，或载入来源图并涂选区")
+    source = np.array(decode_data_url(req.source_data))
+    mask_image = decode_data_url(req.source_mask_data)
+    source_mask = normalize_mask(mask_image, (source.shape[1], source.shape[0]))
+    source_mask = make_protected_soft_patch_mask(
+        source,
+        source_mask,
+        req.contract,
+        req.feather,
+        req.protect_dark,
+    )
+    return crop_patch(source, source_mask, pad=max(8, int(req.pad) + 12))
+
+
 def build_export_patch(req: ExportPatchRequest):
     source = np.array(decode_data_url(req.source_data))
     mask_image = decode_data_url(req.source_mask_data)
@@ -1985,18 +2057,8 @@ def build_export_patch(req: ExportPatchRequest):
 
 
 def build_tuned_patch(req: BlendRequest):
-    source = np.array(decode_data_url(req.source_data))
     target = np.array(decode_data_url(req.target_data))
-    mask_image = decode_data_url(req.source_mask_data)
-    source_mask = normalize_mask(mask_image, (source.shape[1], source.shape[0]))
-    source_mask = make_protected_soft_patch_mask(
-        source,
-        source_mask,
-        req.contract,
-        req.feather,
-        req.protect_dark,
-    )
-    base_patch = crop_patch(source, source_mask, pad=max(8, int(req.pad) + 12))
+    base_patch = build_base_patch(req)
     placement = (req.patches or [
         PatchPlacement(name="patch", x=req.x, y=req.y, scale=req.scale, rotation=req.rotation, flip_x=req.flip_x)
     ])[0]
