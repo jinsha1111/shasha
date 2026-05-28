@@ -23,6 +23,11 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from PIL import Image, ImageOps
 
+try:
+    from skimage.filters import frangi
+except Exception:  # pragma: no cover - optional refinement dependency
+    frangi = None
+
 
 DEFAULT_OUTPUT_DIR = Path("/media/jinsha/娱乐1/眉毛/换眉输出")
 DEFAULT_PATCH_DIR = Path("/media/jinsha/娱乐1/眉毛/眉毛贴片库")
@@ -405,6 +410,7 @@ HTML = r"""<!doctype html>
         <h2>贴片库</h2>
         <label>贴片模式</label>
         <select id="patchMode">
+          <option value="white_bg">白底正片叠底素材</option>
           <option value="hair_only">只保留眉毛线条</option>
           <option value="soft_patch">带羽化皮肤过渡</option>
         </select>
@@ -1653,6 +1659,18 @@ def crop_rgba_by_alpha(rgba: np.ndarray, alpha: np.ndarray, pad=18):
     return patch
 
 
+def crop_rgb_by_mask(rgb: np.ndarray, mask: np.ndarray, pad=18):
+    ys, xs = np.where(mask > 2)
+    if not len(xs):
+        raise HTTPException(status_code=400, detail="来源选区里没有提取到眉毛线条")
+    h, w = mask.shape
+    x1 = max(0, int(xs.min()) - pad)
+    y1 = max(0, int(ys.min()) - pad)
+    x2 = min(w, int(xs.max()) + pad + 1)
+    y2 = min(h, int(ys.max()) + pad + 1)
+    return rgb[y1:y2, x1:x2].copy()
+
+
 def decontaminate_hair_patch(source_rgba: np.ndarray, alpha: np.ndarray):
     rgb = source_rgba[:, :, :3].astype(np.float32)
     gray = cv2.cvtColor(source_rgba[:, :, :3].astype(np.uint8), cv2.COLOR_RGB2GRAY)
@@ -1703,6 +1721,65 @@ def hair_line_alpha(source_rgba: np.ndarray, region_mask: np.ndarray):
     # softly prefer thin/dark strokes and let the manual mask remain the hard boundary.
     alpha = cv2.GaussianBlur(alpha.astype(np.float32), (3, 3), 0)
     return np.clip(alpha * 255.0, 0, 255).astype(np.uint8)
+
+
+def white_bg_brow_patch(source_rgba: np.ndarray, source_mask: np.ndarray, protect_dark: float):
+    region_mask = make_patch_region_mask(source_mask, 0)
+    protect_dark = max(0.0, min(float(protect_dark), 1.0))
+
+    rgb_u8 = source_rgba[:, :, :3].astype(np.uint8)
+    gray = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    mask_float = np.clip(region_mask.astype(np.float32) / 255.0, 0.0, 1.0)
+    h, w = gray.shape
+    ksize = max(21, min(91, int(round(min(h, w) * 0.065)) | 1))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+    local_bg = cv2.morphologyEx(gray.astype(np.uint8), cv2.MORPH_CLOSE, kernel).astype(np.float32)
+    local_bg = cv2.GaussianBlur(local_bg, (0, 0), sigmaX=max(2.0, ksize / 7.0), sigmaY=max(2.0, ksize / 7.0))
+    dark_delta = np.maximum(local_bg - gray, 0.0)
+    selected_delta = dark_delta[mask_float > 0.03]
+    if selected_delta.size < 20:
+        raise HTTPException(status_code=400, detail="来源选区太小，请多涂一点眉毛区域")
+    edge0 = max(3.0, float(np.percentile(selected_delta, 58)) * 0.40)
+    edge1 = max(edge0 + 16.0, float(np.percentile(selected_delta, 96)) * (0.72 + 0.18 * protect_dark))
+    alpha_frac = smoothstep(edge0, edge1, dark_delta) * mask_float
+    if frangi is not None and np.max(dark_delta) > 1:
+        try:
+            ridge_input = np.clip(dark_delta / max(float(np.percentile(dark_delta[mask_float > 0.03], 99)), 1.0), 0.0, 1.0)
+            ridge = frangi(ridge_input, sigmas=(0.8, 1.2, 1.8, 2.6), black_ridges=False)
+            ridge = np.nan_to_num(ridge, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+            ridge_selected = ridge[mask_float > 0.03]
+            if ridge_selected.size >= 20 and float(ridge_selected.max()) > 0:
+                r0 = float(np.percentile(ridge_selected, 64))
+                r1 = max(r0 + 1e-6, float(np.percentile(ridge_selected, 98)))
+                ridge_weight = smoothstep(r0, r1, ridge)
+                alpha_frac *= np.clip(0.08 + 0.92 * ridge_weight, 0.0, 1.0)
+        except Exception:
+            pass
+    alpha_frac = np.power(alpha_frac, 0.72 - 0.22 * protect_dark)
+    alpha_frac = cv2.GaussianBlur(alpha_frac.astype(np.float32), (3, 3), 0)
+    alpha = np.clip(alpha_frac * 255.0, 0, 255).astype(np.uint8)
+
+    rgb = source_rgba[:, :, :3].astype(np.float32)
+    strong = alpha > 90
+    if np.count_nonzero(strong) < 20:
+        strong = alpha > 35
+    if np.count_nonzero(strong) >= 20:
+        gray = cv2.cvtColor(source_rgba[:, :, :3].astype(np.uint8), cv2.COLOR_RGB2GRAY)
+        dark_cutoff = np.percentile(gray[strong], 65)
+        hair_pixels = strong & (gray <= dark_cutoff)
+        if np.count_nonzero(hair_pixels) < 10:
+            hair_pixels = strong
+        hair_color = np.median(rgb[hair_pixels], axis=0)
+    else:
+        hair_color = np.array([70.0, 62.0, 58.0], dtype=np.float32)
+
+    a = alpha.astype(np.float32) / 255.0
+    preserve_original = smoothstep(0.52, 0.95, a)[..., None]
+    clean_line_rgb = hair_color.reshape(1, 1, 3) * (1.0 - preserve_original) + rgb * preserve_original
+    white = np.full_like(rgb, 255.0)
+    out_rgb = white * (1.0 - a[..., None]) + clean_line_rgb * a[..., None]
+    out_rgb[region_mask <= 2] = 255.0
+    return crop_rgb_by_mask(np.clip(out_rgb, 0, 255).astype(np.uint8), alpha, pad=24)
 
 
 def transform_patch(patch: np.ndarray, scale: float, rotation: float, flip_x: bool = False):
@@ -1945,7 +2022,7 @@ def safe_patch_name(name: str, source_name: str, mode: str):
     if name:
         stem = Path(name).stem
     else:
-        mode_label = "line" if mode == "hair_only" else "soft"
+        mode_label = {"hair_only": "line", "soft_patch": "soft", "white_bg": "white_bg"}.get(mode, "patch")
         stem = f"{Path(source_name).stem or 'source'}_brow_patch_{mode_label}_{time.strftime('%Y%m%d_%H%M%S')}"
     stem = re.sub(r"[\\/:*?\"<>|]+", "_", stem).strip() or "brow_patch"
     return stem + ".png"
@@ -1967,6 +2044,9 @@ def build_export_patch(req: ExportPatchRequest):
     source = np.array(decode_data_url(req.source_data))
     mask_image = decode_data_url(req.source_mask_data)
     source_mask = normalize_mask(mask_image, (source.shape[1], source.shape[0]))
+
+    if req.patch_mode == "white_bg":
+        return Image.fromarray(white_bg_brow_patch(source, source_mask, req.protect_dark), "RGB")
 
     if req.patch_mode == "soft_patch":
         adjusted_mask = make_protected_soft_patch_mask(
