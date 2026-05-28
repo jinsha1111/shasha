@@ -367,6 +367,7 @@ HTML = r"""<!doctype html>
         <label>融合模式</label>
         <select id="blendMode">
           <option value="normal_clone">PS式融合</option>
+          <option value="embroidery_layered">纹绣分层融合（实验）</option>
           <option value="alpha">羽化贴片</option>
           <option value="mixed_clone">PS式保边融合</option>
         </select>
@@ -1855,6 +1856,51 @@ def alpha_blend(target_rgba, source_canvas, req: BlendRequest):
     return out
 
 
+def embroidery_layered_blend(target_rgba, source_canvas, req: BlendRequest):
+    target_rgb = target_rgba[:, :, :3].astype(np.float32)
+    alpha = source_canvas[:, :, 3]
+    if np.count_nonzero(alpha > 8) < 20:
+        return target_rgba
+
+    try:
+        line_alpha = hair_line_alpha(source_canvas, alpha)
+    except HTTPException:
+        line_alpha = alpha.copy()
+
+    opacity = max(0.0, min(float(req.opacity), 1.0))
+    protect = max(0.0, min(float(req.protect_dark), 1.0))
+    region = alpha > 8
+    region_frac = np.clip(alpha.astype(np.float32) / 255.0 * opacity, 0.0, 1.0)
+    line_frac = np.clip(line_alpha.astype(np.float32) / 255.0 * opacity, 0.0, 1.0)
+    line_frac = np.clip(np.power(line_frac, 0.88) * (0.72 + 0.28 * protect), 0.0, 1.0)
+
+    skin_fade_strength = max(0.0, min(float(req.skin_tint), 1.0)) * 0.38
+    line_guard = smoothstep(0.10, 0.58, line_frac)
+    skin_alpha = np.clip(region_frac * (1.0 - line_guard) * skin_fade_strength, 0.0, 0.42)
+
+    skin_fill = estimate_skin_fill(
+        target_rgba[:, :, :3],
+        region,
+        skin_alpha,
+        req.skin_sample,
+    )
+    skin_fill_rgb = np.zeros_like(target_rgb)
+    skin_fill_rgb[:, :] = skin_fill
+    target_smooth = cv2.GaussianBlur(target_rgb, (0, 0), sigmaX=2.4, sigmaY=2.4)
+    target_skin = target_smooth * 0.72 + skin_fill_rgb * 0.28
+
+    out_rgb = target_rgb * (1.0 - skin_alpha[..., None]) + target_skin * skin_alpha[..., None]
+
+    hair_rgba = decontaminate_hair_patch(source_canvas, line_alpha)
+    hair_rgb = hair_rgba[:, :, :3].astype(np.float32)
+    hair_strength = np.clip(line_frac * (0.86 + 0.14 * protect), 0.0, 1.0)
+    out_rgb = hair_rgb * hair_strength[..., None] + out_rgb * (1.0 - hair_strength[..., None])
+
+    out = target_rgba.copy()
+    out[:, :, :3] = np.clip(out_rgb, 0, 255).astype(np.uint8)
+    return out
+
+
 def poisson_blend(target_rgba, source_canvas, req: BlendRequest):
     target_rgb = target_rgba[:, :, :3]
     patch_rgb = source_canvas[:, :, :3]
@@ -1927,6 +1973,8 @@ def build_blend(req: BlendRequest):
         canvas = patch_canvas(out.shape, patch, placement.x, placement.y)
         if req.blend_mode == "alpha":
             out = alpha_blend(out, canvas, req)
+        elif req.blend_mode == "embroidery_layered":
+            out = embroidery_layered_blend(out, canvas, req)
         else:
             out = poisson_blend(out, canvas, req)
     return Image.fromarray(out, "RGBA")
