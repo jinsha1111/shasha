@@ -23,6 +23,11 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from PIL import Image, ImageOps
 
+try:
+    from skimage.exposure import match_histograms
+except Exception:  # pragma: no cover - optional runtime dependency
+    match_histograms = None
+
 
 DEFAULT_OUTPUT_DIR = Path("/media/jinsha/娱乐1/眉毛/换眉输出")
 DEFAULT_PATCH_DIR = Path("/media/jinsha/娱乐1/眉毛/眉毛贴片库")
@@ -288,6 +293,26 @@ HTML = r"""<!doctype html>
           <button id="alignSourceColorBtn">对齐目标肤色</button>
           <button id="restoreSourceColorBtn">还原来源</button>
         </div>
+        <div class="row" style="margin-top:8px;">
+          <button id="matchSourceHistBtn">匹配目标色</button>
+          <button id="coolWhiteSourceBtn">冷白皮预设</button>
+        </div>
+        <label>来源曝光 <span class="value" id="sourceExposureValue">0</span></label>
+        <input id="sourceExposure" type="range" min="-100" max="100" value="0" />
+        <label>来源亮度 <span class="value" id="sourceBrightnessValue">0</span></label>
+        <input id="sourceBrightness" type="range" min="-100" max="100" value="0" />
+        <label>来源对比 <span class="value" id="sourceContrastValue">0</span></label>
+        <input id="sourceContrast" type="range" min="-100" max="100" value="0" />
+        <label>来源色温 <span class="value" id="sourceTempValue">0</span></label>
+        <input id="sourceTemp" type="range" min="-100" max="100" value="0" />
+        <label>来源色调 <span class="value" id="sourceTintValue">0</span></label>
+        <input id="sourceTint" type="range" min="-100" max="100" value="0" />
+        <label>来源饱和 <span class="value" id="sourceSaturationValue">0</span></label>
+        <input id="sourceSaturation" type="range" min="-100" max="100" value="0" />
+        <div class="row" style="margin-top:8px;">
+          <button class="primary" id="applySourceToneBtn">应用来源调色</button>
+          <button id="resetSourceToneBtn">重置调色</button>
+        </div>
       </div>
       <div class="card">
         <h2>来源选区</h2>
@@ -464,6 +489,8 @@ HTML = r"""<!doctype html>
     let targetName = 'target';
     let patchName = 'patch';
     let sourceOriginalName = 'source';
+    let sourceToneBaseMode = 'manual';
+    let sourceToneBaseStrength = 0;
     let sourceTool = 'brush';
     let sourceDrawing = false;
     let lastPoint = null;
@@ -544,6 +571,12 @@ HTML = r"""<!doctype html>
       document.getElementById('skinTintValue').textContent = document.getElementById('skinTint').value + '%';
       document.getElementById('protectValue').textContent = document.getElementById('protectDark').value + '%';
       document.getElementById('padValue').textContent = document.getElementById('pad').value;
+      document.getElementById('sourceExposureValue').textContent = document.getElementById('sourceExposure').value;
+      document.getElementById('sourceBrightnessValue').textContent = document.getElementById('sourceBrightness').value;
+      document.getElementById('sourceContrastValue').textContent = document.getElementById('sourceContrast').value;
+      document.getElementById('sourceTempValue').textContent = document.getElementById('sourceTemp').value;
+      document.getElementById('sourceTintValue').textContent = document.getElementById('sourceTint').value;
+      document.getElementById('sourceSaturationValue').textContent = document.getElementById('sourceSaturation').value;
       if (targetImage) {
         const x = Math.round(Number(document.getElementById('posX').value) / 100 * targetImage.naturalWidth);
         const y = Math.round(Number(document.getElementById('posY').value) / 100 * targetImage.naturalHeight);
@@ -844,6 +877,9 @@ HTML = r"""<!doctype html>
         if (!options.keepOriginal) {
           sourceOriginalData = dataUrl;
           sourceOriginalName = name || 'source';
+          sourceToneBaseMode = 'manual';
+          sourceToneBaseStrength = 0;
+          resetSourceToneSliders();
         }
         maskCanvas.width = img.naturalWidth;
         maskCanvas.height = img.naturalHeight;
@@ -936,46 +972,116 @@ HTML = r"""<!doctype html>
       setStatus('已切回来源图选区模式。');
     };
     document.getElementById('alignSourceColorBtn').onclick = async () => {
-      if (!sourceData || !targetData) {
-        setStatus('来源图和目标图都要先载入，才能对齐肤色。');
-        return;
-      }
-      setStatus('正在把来源图肤色对齐到目标图...');
-      const resp = await fetch('/api/align_source_color', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-          source_data: sourceOriginalData || sourceData,
-          target_data: targetData,
-          source_name: sourceOriginalName || sourceName,
-          strength: 0.92
-        })
-      });
-      const data = await resp.json();
-      if (!resp.ok) {
-        setStatus(data.detail || '来源图肤色对齐失败');
-        return;
-      }
-      updateSourceImage(data.data_url, data.name, {
-        keepOriginal: true,
-        keepMask: true,
-        aligned: true,
-        status: `来源图已对齐目标肤色：${data.width} x ${data.height}`
-      });
+      applySourceTone('skin_align', '正在把来源图肤色对齐到目标图...', 0.92);
     };
     document.getElementById('restoreSourceColorBtn').onclick = () => {
       if (!sourceOriginalData) {
         setStatus('还没有可还原的原始来源图。');
         return;
       }
+      sourceToneBaseMode = 'manual';
+      sourceToneBaseStrength = 0;
+      resetSourceToneSliders();
       updateSourceImage(sourceOriginalData, sourceOriginalName, {
         keepOriginal: true,
         keepMask: true,
         status: '已还原原始来源图。'
       });
     };
+    document.getElementById('matchSourceHistBtn').onclick = () => {
+      applySourceTone('histogram_match', '正在匹配目标图色彩分布...', 0.68);
+    };
+    document.getElementById('coolWhiteSourceBtn').onclick = () => {
+      sourceToneBaseMode = 'manual';
+      sourceToneBaseStrength = 0;
+      setVal('sourceExposure', 10);
+      setVal('sourceBrightness', 8);
+      setVal('sourceContrast', -6);
+      setVal('sourceTemp', -28);
+      setVal('sourceTint', 4);
+      setVal('sourceSaturation', -10);
+      applySourceTone('manual', '正在应用冷白皮预设...', 0);
+    };
+    document.getElementById('applySourceToneBtn').onclick = () => {
+      applySourceTone('manual', '正在应用来源图手动调色...', 0);
+    };
+    document.getElementById('resetSourceToneBtn').onclick = () => {
+      sourceToneBaseMode = 'manual';
+      sourceToneBaseStrength = 0;
+      resetSourceToneSliders();
+      if (sourceOriginalData) {
+        updateSourceImage(sourceOriginalData, sourceOriginalName, {
+          keepOriginal: true,
+          keepMask: true,
+          status: '已重置调色并还原来源图。'
+        });
+      } else {
+        setStatus('已重置调色参数。');
+      }
+    };
     document.getElementById('fitSource').onclick = () => { setVal('sourceZoom', 100); redrawSource(); };
     document.getElementById('fitTarget').onclick = () => redrawTarget();
+
+    function sourceTonePayload(mode, matchStrength) {
+      return {
+        source_data: sourceOriginalData || sourceData,
+        target_data: targetData || '',
+        source_name: sourceOriginalName || sourceName,
+        mode,
+        match_strength: matchStrength,
+        exposure: Number(document.getElementById('sourceExposure').value),
+        brightness: Number(document.getElementById('sourceBrightness').value),
+        contrast: Number(document.getElementById('sourceContrast').value),
+        temperature: Number(document.getElementById('sourceTemp').value),
+        tint: Number(document.getElementById('sourceTint').value),
+        saturation: Number(document.getElementById('sourceSaturation').value)
+      };
+    }
+
+    async function applySourceTone(mode, busyText, matchStrength) {
+      if (!sourceData) {
+        setStatus('请先载入来源图。');
+        return;
+      }
+      const effectiveMode = mode === 'manual' ? sourceToneBaseMode : mode;
+      const effectiveStrength = mode === 'manual' ? sourceToneBaseStrength : matchStrength;
+      if ((effectiveMode === 'skin_align' || effectiveMode === 'histogram_match') && !targetData) {
+        setStatus('这个调色方式需要先载入目标图。');
+        return;
+      }
+      setStatus(busyText || '正在调整来源图...');
+      const resp = await fetch('/api/adjust_source', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(sourceTonePayload(effectiveMode, effectiveStrength))
+      });
+      const data = await resp.json();
+      if (!resp.ok) {
+        setStatus(data.detail || '来源图调色失败');
+        return;
+      }
+      if (mode === 'skin_align' || mode === 'histogram_match') {
+        sourceToneBaseMode = mode;
+        sourceToneBaseStrength = matchStrength;
+      }
+      updateSourceImage(data.data_url, data.name, {
+        keepOriginal: true,
+        keepMask: true,
+        aligned: effectiveMode !== 'manual' || hasManualSourceTone(),
+        status: `来源图已调色：${data.width} x ${data.height}`
+      });
+    }
+
+    function hasManualSourceTone() {
+      return ['sourceExposure', 'sourceBrightness', 'sourceContrast', 'sourceTemp', 'sourceTint', 'sourceSaturation']
+        .some(id => Number(document.getElementById(id).value) !== 0);
+    }
+
+    function resetSourceToneSliders() {
+      for (const id of ['sourceExposure', 'sourceBrightness', 'sourceContrast', 'sourceTemp', 'sourceTint', 'sourceSaturation']) {
+        setVal(id, 0);
+      }
+    }
 
     function readFileInput(input, kind) {
       const file = input.files && input.files[0];
@@ -1320,6 +1426,10 @@ HTML = r"""<!doctype html>
       document.getElementById(id).addEventListener('input', onParamChange);
       document.getElementById(id).addEventListener('change', onParamChange);
     }
+    for (const id of ['sourceExposure', 'sourceBrightness', 'sourceContrast', 'sourceTemp', 'sourceTint', 'sourceSaturation']) {
+      document.getElementById(id).addEventListener('input', updateLabels);
+      document.getElementById(id).addEventListener('change', updateLabels);
+    }
 
     function hasPatchSource() {
       return !!patchData || (!!sourceImage && !!getMaskBBox());
@@ -1563,6 +1673,20 @@ class ColorAlignRequest(BaseModel):
     target_data: str
     source_name: str = "source"
     strength: float = 0.92
+
+
+class SourceAdjustRequest(BaseModel):
+    source_data: str
+    target_data: str = ""
+    source_name: str = "source"
+    mode: str = "manual"
+    match_strength: float = 0.0
+    exposure: float = 0.0
+    brightness: float = 0.0
+    contrast: float = 0.0
+    temperature: float = 0.0
+    tint: float = 0.0
+    saturation: float = 0.0
 
 
 class PatchPlacement(BaseModel):
@@ -1988,6 +2112,89 @@ def align_source_to_target_skin(source_rgba: np.ndarray, target_rgba: np.ndarray
     return out
 
 
+def histogram_match_rgba(source_rgba: np.ndarray, target_rgba: np.ndarray, strength: float = 0.68):
+    if match_histograms is None:
+        return align_source_to_target_skin(source_rgba, target_rgba, strength)
+    strength = max(0.0, min(float(strength), 1.0))
+    source_rgb = source_rgba[:, :, :3].astype(np.uint8)
+    target_rgb = target_rgba[:, :, :3].astype(np.uint8)
+    matched = match_histograms(source_rgb, target_rgb, channel_axis=-1)
+    matched = np.clip(matched, 0, 255).astype(np.float32)
+    out_rgb = source_rgb.astype(np.float32) * (1.0 - strength) + matched * strength
+    out = source_rgba.copy()
+    out[:, :, :3] = np.clip(out_rgb, 0, 255).astype(np.uint8)
+    return out
+
+
+def apply_source_manual_adjustments(
+    rgba: np.ndarray,
+    exposure: float = 0.0,
+    brightness: float = 0.0,
+    contrast: float = 0.0,
+    temperature: float = 0.0,
+    tint: float = 0.0,
+    saturation: float = 0.0,
+):
+    rgb = rgba[:, :, :3].astype(np.float32)
+
+    exposure = max(-100.0, min(float(exposure), 100.0))
+    brightness = max(-100.0, min(float(brightness), 100.0))
+    contrast = max(-100.0, min(float(contrast), 100.0))
+    temperature = max(-100.0, min(float(temperature), 100.0))
+    tint = max(-100.0, min(float(tint), 100.0))
+    saturation = max(-100.0, min(float(saturation), 100.0))
+
+    exposure_gain = 2.0 ** (exposure / 50.0)
+    rgb = rgb * exposure_gain
+    rgb = rgb + brightness * 1.2
+    contrast_gain = 1.0 + contrast / 100.0 * 1.35
+    rgb = (rgb - 127.5) * contrast_gain + 127.5
+    rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    # Positive temperature warms/yellows the image; negative pushes toward cooler blue.
+    lab[:, :, 2] = np.clip(lab[:, :, 2] + temperature * 0.55, 0, 255)
+    # Positive tint moves toward magenta; negative toward green.
+    lab[:, :, 1] = np.clip(lab[:, :, 1] + tint * 0.45, 0, 255)
+    rgb = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2RGB)
+
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV).astype(np.float32)
+    sat_gain = 1.0 + saturation / 100.0 * 1.2
+    hsv[:, :, 1] = np.clip(hsv[:, :, 1] * sat_gain, 0, 255)
+    rgb = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
+
+    out = rgba.copy()
+    out[:, :, :3] = rgb
+    return out
+
+
+def adjust_source_image(req: SourceAdjustRequest):
+    source = np.array(decode_data_url(req.source_data))
+    mode = (req.mode or "manual").strip()
+    adjusted = source
+    if mode in {"skin_align", "histogram_match"}:
+        if not req.target_data:
+            raise HTTPException(status_code=400, detail="这个调色方式需要目标图")
+        target = np.array(decode_data_url(req.target_data))
+        if mode == "histogram_match":
+            adjusted = histogram_match_rgba(adjusted, target, req.match_strength)
+        else:
+            adjusted = align_source_to_target_skin(adjusted, target, req.match_strength or 0.92)
+    elif mode != "manual":
+        raise HTTPException(status_code=400, detail=f"未知调色模式: {mode}")
+
+    adjusted = apply_source_manual_adjustments(
+        adjusted,
+        req.exposure,
+        req.brightness,
+        req.contrast,
+        req.temperature,
+        req.tint,
+        req.saturation,
+    )
+    return Image.fromarray(adjusted, "RGBA")
+
+
 def estimate_skin_fill(target_rgb, alpha_mask, skin_weight, skin_sample=None):
     if skin_sample:
         return np.array(skin_sample[:3], dtype=np.float32)
@@ -2293,6 +2500,24 @@ def align_source_color(req: ColorAlignRequest):
     result = Image.fromarray(align_source_to_target_skin(source, target, req.strength), "RGBA")
     source_stem = Path(req.source_name or "source").stem
     name = re.sub(r"[\\/:*?\"<>|]+", "_", f"{source_stem}_aligned_to_target").strip() + ".png"
+    return {
+        "name": name,
+        "width": result.width,
+        "height": result.height,
+        "data_url": image_to_data_url(result),
+    }
+
+
+@app.post("/api/adjust_source")
+def adjust_source(req: SourceAdjustRequest):
+    result = adjust_source_image(req)
+    source_stem = Path(req.source_name or "source").stem
+    mode_label = {
+        "skin_align": "skin_matched",
+        "histogram_match": "hist_matched",
+        "manual": "adjusted",
+    }.get(req.mode, "adjusted")
+    name = re.sub(r"[\\/:*?\"<>|]+", "_", f"{source_stem}_{mode_label}").strip() + ".png"
     return {
         "name": name,
         "width": result.width,
