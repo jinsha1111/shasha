@@ -23,11 +23,6 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from PIL import Image, ImageOps
 
-try:
-    from skimage.exposure import match_histograms
-except Exception:  # pragma: no cover - optional runtime dependency
-    match_histograms = None
-
 
 DEFAULT_OUTPUT_DIR = Path("/media/jinsha/娱乐1/眉毛/换眉输出")
 DEFAULT_PATCH_DIR = Path("/media/jinsha/娱乐1/眉毛/眉毛贴片库")
@@ -289,30 +284,6 @@ HTML = r"""<!doctype html>
         </div>
         <label>浏览器选择来源</label>
         <input id="sourceFile" type="file" accept="image/*" />
-        <div class="row" style="margin-top:8px;">
-          <button id="alignSourceColorBtn">对齐目标肤色</button>
-          <button id="restoreSourceColorBtn">还原来源</button>
-        </div>
-        <div class="row" style="margin-top:8px;">
-          <button id="matchSourceHistBtn">匹配目标色</button>
-          <button id="coolWhiteSourceBtn">冷白皮预设</button>
-        </div>
-        <label>来源曝光 <span class="value" id="sourceExposureValue">0</span></label>
-        <input id="sourceExposure" type="range" min="-100" max="100" value="0" />
-        <label>来源亮度 <span class="value" id="sourceBrightnessValue">0</span></label>
-        <input id="sourceBrightness" type="range" min="-100" max="100" value="0" />
-        <label>来源对比 <span class="value" id="sourceContrastValue">0</span></label>
-        <input id="sourceContrast" type="range" min="-100" max="100" value="0" />
-        <label>来源色温 <span class="value" id="sourceTempValue">0</span></label>
-        <input id="sourceTemp" type="range" min="-100" max="100" value="0" />
-        <label>来源色调 <span class="value" id="sourceTintValue">0</span></label>
-        <input id="sourceTint" type="range" min="-100" max="100" value="0" />
-        <label>来源饱和 <span class="value" id="sourceSaturationValue">0</span></label>
-        <input id="sourceSaturation" type="range" min="-100" max="100" value="0" />
-        <div class="row" style="margin-top:8px;">
-          <button class="primary" id="applySourceToneBtn">应用来源调色</button>
-          <button id="resetSourceToneBtn">重置调色</button>
-        </div>
       </div>
       <div class="card">
         <h2>来源选区</h2>
@@ -413,7 +384,6 @@ HTML = r"""<!doctype html>
           <span id="skinSwatch" class="swatch"></span>
           <span id="skinText">未吸取目标肤色</span>
         </div>
-        <button id="autoColorAlignBtn" style="width:100%; margin-top:10px;">自动对齐肤色</button>
         <label>眉毛保护 <span class="value" id="protectValue">90%</span></label>
         <input id="protectDark" type="range" min="0" max="100" value="90" />
         <label>输出留边 <span class="value" id="padValue">0</span></label>
@@ -433,16 +403,6 @@ HTML = r"""<!doctype html>
 
       <div class="card">
         <h2>贴片库</h2>
-        <label>载入已保存贴片</label>
-        <input id="patchPath" type="text" value="/media/jinsha/娱乐1/眉毛/眉毛贴片库/野生眉1.png" />
-        <div class="row" style="margin-top:8px;">
-          <button id="loadPatchPath">打开贴片</button>
-          <button id="clearLoadedPatch">不用贴片</button>
-        </div>
-        <label>浏览器选择贴片</label>
-        <input id="patchFile" type="file" accept="image/*" />
-        <div class="status" id="patchInfo" style="margin-top:8px;">未载入贴片，当前使用来源图选区。</div>
-        <hr style="border:0; border-top:1px solid var(--line); margin:12px 0;" />
         <label>贴片模式</label>
         <select id="patchMode">
           <option value="hair_only">只保留眉毛线条</option>
@@ -475,22 +435,14 @@ HTML = r"""<!doctype html>
     const statusEl = document.getElementById('status');
     const sourceInfo = document.getElementById('sourceInfo');
     const targetInfo = document.getElementById('targetInfo');
-    const patchInfo = document.getElementById('patchInfo');
 
     let sourceImage = null;
     let targetImage = null;
-    let patchImage = null;
     let sourceData = '';
     let targetData = '';
-    let patchData = '';
-    let sourceOriginalData = '';
     let targetPreviewImage = null;
     let sourceName = 'source';
     let targetName = 'target';
-    let patchName = 'patch';
-    let sourceOriginalName = 'source';
-    let sourceToneBaseMode = 'manual';
-    let sourceToneBaseStrength = 0;
     let sourceTool = 'brush';
     let sourceDrawing = false;
     let lastPoint = null;
@@ -571,12 +523,6 @@ HTML = r"""<!doctype html>
       document.getElementById('skinTintValue').textContent = document.getElementById('skinTint').value + '%';
       document.getElementById('protectValue').textContent = document.getElementById('protectDark').value + '%';
       document.getElementById('padValue').textContent = document.getElementById('pad').value;
-      document.getElementById('sourceExposureValue').textContent = document.getElementById('sourceExposure').value;
-      document.getElementById('sourceBrightnessValue').textContent = document.getElementById('sourceBrightness').value;
-      document.getElementById('sourceContrastValue').textContent = document.getElementById('sourceContrast').value;
-      document.getElementById('sourceTempValue').textContent = document.getElementById('sourceTemp').value;
-      document.getElementById('sourceTintValue').textContent = document.getElementById('sourceTint').value;
-      document.getElementById('sourceSaturationValue').textContent = document.getElementById('sourceSaturation').value;
       if (targetImage) {
         const x = Math.round(Number(document.getElementById('posX').value) / 100 * targetImage.naturalWidth);
         const y = Math.round(Number(document.getElementById('posY').value) / 100 * targetImage.naturalHeight);
@@ -789,18 +735,13 @@ HTML = r"""<!doctype html>
     }
 
     function drawFastPatchPreview() {
-      if (!targetImage) return;
+      if (!sourceImage || !targetImage) return;
+      const bbox = livePatchBBox();
+      if (!bbox) return;
       const opacity = Number(document.getElementById('opacity').value) / 100;
-      const loadedPatch = patchImage;
-      const bbox = loadedPatch ? null : livePatchBBox();
-      if (!loadedPatch && (!sourceImage || !bbox)) return;
-      const alphaCanvas = loadedPatch ? null : makeInnerAlphaCanvas(
-        bbox,
-        Number(document.getElementById('feather').value),
-        Number(document.getElementById('contract').value)
-      );
-      const patchW = loadedPatch ? loadedPatch.naturalWidth : bbox.w;
-      const patchH = loadedPatch ? loadedPatch.naturalHeight : bbox.h;
+      const feather = Number(document.getElementById('feather').value);
+      const contract = Number(document.getElementById('contract').value);
+      const alphaCanvas = makeInnerAlphaCanvas(bbox, feather, contract);
       for (const [name, p] of Object.entries(patches)) {
         if (!p.enabled) continue;
         const x = p.xPct / 100 * targetCanvas.width;
@@ -813,18 +754,14 @@ HTML = r"""<!doctype html>
         targetCtx.scale(p.flip ? -scale : scale, scale);
 
         const patch = document.createElement('canvas');
-        patch.width = patchW;
-        patch.height = patchH;
+        patch.width = bbox.w;
+        patch.height = bbox.h;
         const patchCtx = patch.getContext('2d');
-        if (loadedPatch) {
-          patchCtx.drawImage(loadedPatch, 0, 0, patchW, patchH);
-        } else {
-          patchCtx.drawImage(sourceImage, bbox.x, bbox.y, bbox.w, bbox.h, 0, 0, bbox.w, bbox.h);
+        patchCtx.drawImage(sourceImage, bbox.x, bbox.y, bbox.w, bbox.h, 0, 0, bbox.w, bbox.h);
 
-          patchCtx.globalCompositeOperation = 'destination-in';
-          patchCtx.drawImage(alphaCanvas, 0, 0);
-        }
-        targetCtx.drawImage(patch, -patchW / 2, -patchH / 2);
+        patchCtx.globalCompositeOperation = 'destination-in';
+        patchCtx.drawImage(alphaCanvas, 0, 0);
+        targetCtx.drawImage(patch, -bbox.w / 2, -bbox.h / 2);
         targetCtx.restore();
       }
     }
@@ -864,52 +801,23 @@ HTML = r"""<!doctype html>
       targetHitCtx.restore();
     }
 
-    function updateSourceImage(dataUrl, name, options = {}) {
-      const img = new Image();
-      img.onload = () => {
-        const oldMask = maskCanvas.width && maskCanvas.height
-          ? maskCtx.getImageData(0, 0, maskCanvas.width, maskCanvas.height)
-          : null;
-        const canKeepMask = !!oldMask && oldMask.width === img.naturalWidth && oldMask.height === img.naturalHeight;
-        sourceImage = img;
-        sourceData = dataUrl;
-        sourceName = name || 'source';
-        if (!options.keepOriginal) {
-          sourceOriginalData = dataUrl;
-          sourceOriginalName = name || 'source';
-          sourceToneBaseMode = 'manual';
-          sourceToneBaseStrength = 0;
-          resetSourceToneSliders();
-        }
-        maskCanvas.width = img.naturalWidth;
-        maskCanvas.height = img.naturalHeight;
-        maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
-        if (options.keepMask && canKeepMask) {
-          maskCtx.putImageData(oldMask, 0, 0);
-        } else {
-          undoStack = [];
-          maskBBoxCache = null;
-        }
-        if (options.keepMask && canKeepMask) maskBBoxCache = null;
-        invalidatePreview();
-        resultImg.removeAttribute('src');
-        sourceInfo.textContent = `${img.naturalWidth} x ${img.naturalHeight}${options.aligned ? ' · 已对齐' : ''}`;
-        redrawSource();
-        redrawTarget({ fast: true });
-        if (getMaskBBox()) schedulePreview();
-        setStatus(options.status || (options.aligned ? '来源图已按目标肤色对齐。' : '图片已载入。'));
-      };
-      img.src = dataUrl;
-    }
-
     function loadImageData(dataUrl, name, kind) {
       const img = new Image();
       img.onload = () => {
         if (kind === 'source') {
-          img.onload = null;
-          updateSourceImage(dataUrl, name, { keepOriginal: false, keepMask: false });
-          return;
-        } else if (kind === 'target') {
+          sourceImage = img;
+          sourceData = dataUrl;
+          sourceName = name || 'source';
+          maskCanvas.width = img.naturalWidth;
+          maskCanvas.height = img.naturalHeight;
+          maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
+          maskBBoxCache = null;
+          invalidatePreview();
+          undoStack = [];
+          sourceInfo.textContent = `${img.naturalWidth} x ${img.naturalHeight}`;
+          redrawSource();
+          redrawTarget({ fast: true });
+        } else {
           targetImage = img;
           targetData = dataUrl;
           targetPreviewImage = null;
@@ -925,18 +833,9 @@ HTML = r"""<!doctype html>
           patches.secondary.yPct = 35;
           setActivePatch('primary');
           redrawTarget({ fast: true });
-        } else if (kind === 'patch') {
-          patchImage = img;
-          patchData = dataUrl;
-          patchName = name || 'patch';
-          patchInfo.innerHTML = `<strong>已载入贴片：</strong>${patchName}<br>${img.naturalWidth} x ${img.naturalHeight}`;
-          resultImg.removeAttribute('src');
-          hasPreview = false;
-          redrawTarget({ fast: true });
-          schedulePreview();
         }
         hasPreview = false;
-        if (kind !== 'patch') resultImg.removeAttribute('src');
+        resultImg.removeAttribute('src');
         setStatus('图片已载入。');
       };
       img.src = dataUrl;
@@ -960,128 +859,8 @@ HTML = r"""<!doctype html>
 
     document.getElementById('loadSourcePath').onclick = () => loadPath(document.getElementById('sourcePath').value.trim(), 'source');
     document.getElementById('loadTargetPath').onclick = () => loadPath(document.getElementById('targetPath').value.trim(), 'target');
-    document.getElementById('loadPatchPath').onclick = () => loadPath(document.getElementById('patchPath').value.trim(), 'patch');
-    document.getElementById('clearLoadedPatch').onclick = () => {
-      patchImage = null;
-      patchData = '';
-      patchName = 'patch';
-      patchInfo.textContent = '未载入贴片，当前使用来源图选区。';
-      hasPreview = false;
-      resultImg.removeAttribute('src');
-      redrawTarget({ fast: true });
-      setStatus('已切回来源图选区模式。');
-    };
-    document.getElementById('alignSourceColorBtn').onclick = async () => {
-      applySourceTone('skin_align', '正在把来源图肤色对齐到目标图...', 0.92);
-    };
-    document.getElementById('restoreSourceColorBtn').onclick = () => {
-      if (!sourceOriginalData) {
-        setStatus('还没有可还原的原始来源图。');
-        return;
-      }
-      sourceToneBaseMode = 'manual';
-      sourceToneBaseStrength = 0;
-      resetSourceToneSliders();
-      updateSourceImage(sourceOriginalData, sourceOriginalName, {
-        keepOriginal: true,
-        keepMask: true,
-        status: '已还原原始来源图。'
-      });
-    };
-    document.getElementById('matchSourceHistBtn').onclick = () => {
-      applySourceTone('histogram_match', '正在匹配目标图色彩分布...', 0.68);
-    };
-    document.getElementById('coolWhiteSourceBtn').onclick = () => {
-      sourceToneBaseMode = 'manual';
-      sourceToneBaseStrength = 0;
-      setVal('sourceExposure', 10);
-      setVal('sourceBrightness', 8);
-      setVal('sourceContrast', -6);
-      setVal('sourceTemp', -28);
-      setVal('sourceTint', 4);
-      setVal('sourceSaturation', -10);
-      applySourceTone('manual', '正在应用冷白皮预设...', 0);
-    };
-    document.getElementById('applySourceToneBtn').onclick = () => {
-      applySourceTone('manual', '正在应用来源图手动调色...', 0);
-    };
-    document.getElementById('resetSourceToneBtn').onclick = () => {
-      sourceToneBaseMode = 'manual';
-      sourceToneBaseStrength = 0;
-      resetSourceToneSliders();
-      if (sourceOriginalData) {
-        updateSourceImage(sourceOriginalData, sourceOriginalName, {
-          keepOriginal: true,
-          keepMask: true,
-          status: '已重置调色并还原来源图。'
-        });
-      } else {
-        setStatus('已重置调色参数。');
-      }
-    };
     document.getElementById('fitSource').onclick = () => { setVal('sourceZoom', 100); redrawSource(); };
     document.getElementById('fitTarget').onclick = () => redrawTarget();
-
-    function sourceTonePayload(mode, matchStrength) {
-      return {
-        source_data: sourceOriginalData || sourceData,
-        target_data: targetData || '',
-        source_name: sourceOriginalName || sourceName,
-        mode,
-        match_strength: matchStrength,
-        exposure: Number(document.getElementById('sourceExposure').value),
-        brightness: Number(document.getElementById('sourceBrightness').value),
-        contrast: Number(document.getElementById('sourceContrast').value),
-        temperature: Number(document.getElementById('sourceTemp').value),
-        tint: Number(document.getElementById('sourceTint').value),
-        saturation: Number(document.getElementById('sourceSaturation').value)
-      };
-    }
-
-    async function applySourceTone(mode, busyText, matchStrength) {
-      if (!sourceData) {
-        setStatus('请先载入来源图。');
-        return;
-      }
-      const effectiveMode = mode === 'manual' ? sourceToneBaseMode : mode;
-      const effectiveStrength = mode === 'manual' ? sourceToneBaseStrength : matchStrength;
-      if ((effectiveMode === 'skin_align' || effectiveMode === 'histogram_match') && !targetData) {
-        setStatus('这个调色方式需要先载入目标图。');
-        return;
-      }
-      setStatus(busyText || '正在调整来源图...');
-      const resp = await fetch('/api/adjust_source', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify(sourceTonePayload(effectiveMode, effectiveStrength))
-      });
-      const data = await resp.json();
-      if (!resp.ok) {
-        setStatus(data.detail || '来源图调色失败');
-        return;
-      }
-      if (mode === 'skin_align' || mode === 'histogram_match') {
-        sourceToneBaseMode = mode;
-        sourceToneBaseStrength = matchStrength;
-      }
-      updateSourceImage(data.data_url, data.name, {
-        keepOriginal: true,
-        keepMask: true,
-        aligned: effectiveMode !== 'manual' || hasManualSourceTone(),
-        status: `来源图已调色：${data.width} x ${data.height}`
-      });
-    }
-
-    function hasManualSourceTone() {
-      return ['sourceExposure', 'sourceBrightness', 'sourceContrast', 'sourceTemp', 'sourceTint', 'sourceSaturation']
-        .some(id => Number(document.getElementById(id).value) !== 0);
-    }
-
-    function resetSourceToneSliders() {
-      for (const id of ['sourceExposure', 'sourceBrightness', 'sourceContrast', 'sourceTemp', 'sourceTint', 'sourceSaturation']) {
-        setVal(id, 0);
-      }
-    }
 
     function readFileInput(input, kind) {
       const file = input.files && input.files[0];
@@ -1092,7 +871,6 @@ HTML = r"""<!doctype html>
     }
     document.getElementById('sourceFile').addEventListener('change', ev => readFileInput(ev.target, 'source'));
     document.getElementById('targetFile').addEventListener('change', ev => readFileInput(ev.target, 'target'));
-    document.getElementById('patchFile').addEventListener('change', ev => readFileInput(ev.target, 'patch'));
 
     function sourcePoint(ev) {
       const rect = sourcePaintCanvas.getBoundingClientRect();
@@ -1277,15 +1055,6 @@ HTML = r"""<!doctype html>
     }
     document.getElementById('moveTargetBtn').onclick = () => setTargetTool('move');
     document.getElementById('eyedropperBtn').onclick = () => setTargetTool('eyedropper');
-    document.getElementById('autoColorAlignBtn').onclick = () => {
-      setVal('colorMatch', 85);
-      setVal('skinTint', 82);
-      setVal('protectDark', 95);
-      setVal('opacity', 100);
-      redrawTarget({ fast: true });
-      schedulePreview();
-      setStatus('已启用较强肤色对齐，正在更新精细预览。');
-    };
     document.getElementById('primaryPatchBtn').onclick = () => setActivePatch('primary');
     document.getElementById('secondaryPatchBtn').onclick = () => setActivePatch('secondary');
     document.getElementById('copyPatchBtn').onclick = () => {
@@ -1426,18 +1195,6 @@ HTML = r"""<!doctype html>
       document.getElementById(id).addEventListener('input', onParamChange);
       document.getElementById(id).addEventListener('change', onParamChange);
     }
-    for (const id of ['sourceExposure', 'sourceBrightness', 'sourceContrast', 'sourceTemp', 'sourceTint', 'sourceSaturation']) {
-      document.getElementById(id).addEventListener('input', updateLabels);
-      document.getElementById(id).addEventListener('change', updateLabels);
-    }
-
-    function hasPatchSource() {
-      return !!patchData || (!!sourceImage && !!getMaskBBox());
-    }
-
-    function sourceMaskData() {
-      return maskCanvas.width && maskCanvas.height ? maskCanvas.toDataURL('image/png') : '';
-    }
 
     function payload(save) {
       syncPatchFromControls();
@@ -1455,9 +1212,7 @@ HTML = r"""<!doctype html>
       }
       return {
         source_data: sourceData,
-        source_mask_data: sourceMaskData(),
-        patch_data: patchData,
-        patch_name: patchName,
+        source_mask_data: maskCanvas.toDataURL('image/png'),
         target_data: targetData,
         source_name: sourceName,
         target_name: targetName,
@@ -1481,7 +1236,7 @@ HTML = r"""<!doctype html>
     function patchPayload(save) {
       return {
         source_data: sourceData,
-        source_mask_data: sourceMaskData(),
+        source_mask_data: maskCanvas.toDataURL('image/png'),
         source_name: sourceName,
         patch_mode: document.getElementById('patchMode').value,
         feather: Number(document.getElementById('feather').value),
@@ -1499,9 +1254,7 @@ HTML = r"""<!doctype html>
       const p = activePatchData();
       return {
         source_data: sourceData,
-        source_mask_data: sourceMaskData(),
-        patch_data: patchData,
-        patch_name: patchName,
+        source_mask_data: maskCanvas.toDataURL('image/png'),
         target_data: targetData,
         source_name: sourceName,
         target_name: targetName,
@@ -1530,12 +1283,12 @@ HTML = r"""<!doctype html>
     }
 
     async function process(save) {
-      if (!targetImage) {
-        setStatus('请先载入目标图。');
+      if (!sourceImage || !targetImage) {
+        setStatus('来源图和目标图都要先载入。');
         return;
       }
-      if (!hasPatchSource()) {
-        setStatus('请先载入已保存贴片，或在来源图上涂出眉毛区域。');
+      if (!getMaskBBox()) {
+        setStatus('来源选区为空，请先在来源图上涂出眉毛区域。');
         return;
       }
       if (processBusy && !save) {
@@ -1611,12 +1364,12 @@ HTML = r"""<!doctype html>
     }
 
     async function exportTunedPatch(save) {
-      if (!targetImage) {
-        setStatus('请先载入目标图，才能保存当前调好贴片。');
+      if (!sourceImage || !targetImage) {
+        setStatus('来源图和目标图都要先载入，才能保存当前调好贴片。');
         return;
       }
-      if (!hasPatchSource()) {
-        setStatus('请先载入已保存贴片，或在来源图上涂出眉毛区域。');
+      if (!getMaskBBox()) {
+        setStatus('来源选区为空，请先在来源图上涂出眉毛区域。');
         return;
       }
       setStatus('正在保存当前调好贴片...');
@@ -1644,7 +1397,7 @@ HTML = r"""<!doctype html>
     }
 
     function schedulePreview() {
-      if (!targetImage || !hasPatchSource()) return;
+      if (!sourceImage || !targetImage || !getMaskBBox()) return;
       clearTimeout(previewTimer);
       previewTimer = setTimeout(() => process(false), 350);
     }
@@ -1668,27 +1421,6 @@ class PathRequest(BaseModel):
     path: str
 
 
-class ColorAlignRequest(BaseModel):
-    source_data: str
-    target_data: str
-    source_name: str = "source"
-    strength: float = 0.92
-
-
-class SourceAdjustRequest(BaseModel):
-    source_data: str
-    target_data: str = ""
-    source_name: str = "source"
-    mode: str = "manual"
-    match_strength: float = 0.0
-    exposure: float = 0.0
-    brightness: float = 0.0
-    contrast: float = 0.0
-    temperature: float = 0.0
-    tint: float = 0.0
-    saturation: float = 0.0
-
-
 class PatchPlacement(BaseModel):
     name: str = "patch"
     x: float = 0
@@ -1702,8 +1434,6 @@ class BlendRequest(BaseModel):
     source_data: str
     source_mask_data: str
     target_data: str
-    patch_data: str = ""
-    patch_name: str = "patch"
     source_name: str = "source"
     target_name: str = "target"
     patches: list[PatchPlacement] = Field(default_factory=list)
@@ -2018,183 +1748,6 @@ def smoothstep(edge0: float, edge1: float, value):
     return t * t * (3.0 - 2.0 * t)
 
 
-def central_region_mask(shape, x_margin=0.08, y_margin=0.04):
-    h, w = shape[:2]
-    mask = np.zeros((h, w), dtype=bool)
-    x1 = int(round(w * x_margin))
-    x2 = int(round(w * (1.0 - x_margin)))
-    y1 = int(round(h * y_margin))
-    y2 = int(round(h * (1.0 - y_margin)))
-    mask[y1:y2, x1:x2] = True
-    return mask
-
-
-def skin_alignment_stats(rgb: np.ndarray):
-    rgb_u8 = rgb.astype(np.uint8)
-    lab = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2LAB).astype(np.float32)
-    hsv = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2HSV)
-    gray = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2GRAY).astype(np.float32)
-    sat = hsv[:, :, 1].astype(np.float32)
-    a_chan = lab[:, :, 1]
-    b_chan = lab[:, :, 2]
-    center = central_region_mask(rgb.shape)
-
-    chroma_like_skin = (sat > 5) | (a_chan > 131) | (b_chan > 132)
-    valid = center & (gray > 45) & (gray < 245) & (sat < 165) & chroma_like_skin
-    if np.count_nonzero(valid) < 250:
-        valid = (gray > 45) & (gray < 245) & (sat < 165) & chroma_like_skin
-    if np.count_nonzero(valid) < 250:
-        valid = center & (gray > 45) & (gray < 245)
-    if np.count_nonzero(valid) < 50:
-        valid = gray > 20
-
-    values = gray[valid]
-    if values.size >= 50:
-        low = np.percentile(values, 24)
-        high = np.percentile(values, 94)
-        trimmed = valid & (gray >= low) & (gray <= high)
-        if np.count_nonzero(trimmed) >= 50:
-            valid = trimmed
-
-    selected = lab[valid]
-    if selected.size < 150:
-        selected = lab.reshape(-1, 3)
-        valid = np.ones(gray.shape, dtype=bool)
-
-    mean = np.median(selected, axis=0)
-    lo = np.percentile(selected, 16, axis=0)
-    hi = np.percentile(selected, 84, axis=0)
-    std = np.maximum((hi - lo) / 2.0, 4.0)
-    return mean.astype(np.float32), std.astype(np.float32), valid
-
-
-def source_skin_alignment_weight(rgb: np.ndarray, skin_mask: np.ndarray):
-    rgb_u8 = rgb.astype(np.uint8)
-    hsv = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2HSV)
-    gray = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2GRAY).astype(np.float32)
-    sat = hsv[:, :, 1].astype(np.float32)
-    selected = gray[skin_mask]
-    if selected.size < 50:
-        selected = gray.reshape(-1)
-    low = np.percentile(selected, 18)
-    mid = np.percentile(selected, 55)
-    high = np.percentile(selected, 90)
-
-    luminance_weight = smoothstep(low - 8, mid + 24, gray)
-    bright_limit = 1.0 - smoothstep(high + 10, 255, gray)
-    saturation_limit = 1.0 - smoothstep(145, 210, sat)
-    mask_weight = cv2.GaussianBlur(skin_mask.astype(np.float32), (0, 0), sigmaX=9.0, sigmaY=9.0)
-    weight = np.maximum(mask_weight, luminance_weight * bright_limit * saturation_limit)
-
-    # Keep eyebrow and eyelash strokes from being recolored with the skin.
-    dark_protect = 1.0 - smoothstep(low - 18, low + 42, gray)
-    weight = weight * (1.0 - dark_protect * 0.9)
-    return np.clip(weight, 0.0, 1.0)
-
-
-def align_source_to_target_skin(source_rgba: np.ndarray, target_rgba: np.ndarray, strength: float = 0.92):
-    strength = max(0.0, min(float(strength), 1.0))
-    source_rgb = source_rgba[:, :, :3].astype(np.uint8)
-    target_rgb = target_rgba[:, :, :3].astype(np.uint8)
-    src_mean, src_std, src_skin_mask = skin_alignment_stats(source_rgb)
-    dst_mean, dst_std, _ = skin_alignment_stats(target_rgb)
-
-    source_lab = cv2.cvtColor(source_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
-    scale = np.clip(dst_std / np.maximum(src_std, 1e-6), 0.72, 1.32)
-    matched_lab = (source_lab - src_mean.reshape(1, 1, 3)) * scale.reshape(1, 1, 3) + dst_mean.reshape(1, 1, 3)
-    matched_lab = np.clip(matched_lab, 0, 255).astype(np.uint8)
-    matched_rgb = cv2.cvtColor(matched_lab, cv2.COLOR_LAB2RGB).astype(np.float32)
-
-    weight = source_skin_alignment_weight(source_rgb, src_skin_mask) * strength
-    out_rgb = source_rgb.astype(np.float32) * (1.0 - weight[..., None]) + matched_rgb * weight[..., None]
-    out = source_rgba.copy()
-    out[:, :, :3] = np.clip(out_rgb, 0, 255).astype(np.uint8)
-    return out
-
-
-def histogram_match_rgba(source_rgba: np.ndarray, target_rgba: np.ndarray, strength: float = 0.68):
-    if match_histograms is None:
-        return align_source_to_target_skin(source_rgba, target_rgba, strength)
-    strength = max(0.0, min(float(strength), 1.0))
-    source_rgb = source_rgba[:, :, :3].astype(np.uint8)
-    target_rgb = target_rgba[:, :, :3].astype(np.uint8)
-    matched = match_histograms(source_rgb, target_rgb, channel_axis=-1)
-    matched = np.clip(matched, 0, 255).astype(np.float32)
-    out_rgb = source_rgb.astype(np.float32) * (1.0 - strength) + matched * strength
-    out = source_rgba.copy()
-    out[:, :, :3] = np.clip(out_rgb, 0, 255).astype(np.uint8)
-    return out
-
-
-def apply_source_manual_adjustments(
-    rgba: np.ndarray,
-    exposure: float = 0.0,
-    brightness: float = 0.0,
-    contrast: float = 0.0,
-    temperature: float = 0.0,
-    tint: float = 0.0,
-    saturation: float = 0.0,
-):
-    rgb = rgba[:, :, :3].astype(np.float32)
-
-    exposure = max(-100.0, min(float(exposure), 100.0))
-    brightness = max(-100.0, min(float(brightness), 100.0))
-    contrast = max(-100.0, min(float(contrast), 100.0))
-    temperature = max(-100.0, min(float(temperature), 100.0))
-    tint = max(-100.0, min(float(tint), 100.0))
-    saturation = max(-100.0, min(float(saturation), 100.0))
-
-    exposure_gain = 2.0 ** (exposure / 50.0)
-    rgb = rgb * exposure_gain
-    rgb = rgb + brightness * 1.2
-    contrast_gain = 1.0 + contrast / 100.0 * 1.35
-    rgb = (rgb - 127.5) * contrast_gain + 127.5
-    rgb = np.clip(rgb, 0, 255).astype(np.uint8)
-
-    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
-    # Positive temperature warms/yellows the image; negative pushes toward cooler blue.
-    lab[:, :, 2] = np.clip(lab[:, :, 2] + temperature * 0.55, 0, 255)
-    # Positive tint moves toward magenta; negative toward green.
-    lab[:, :, 1] = np.clip(lab[:, :, 1] + tint * 0.45, 0, 255)
-    rgb = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2RGB)
-
-    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV).astype(np.float32)
-    sat_gain = 1.0 + saturation / 100.0 * 1.2
-    hsv[:, :, 1] = np.clip(hsv[:, :, 1] * sat_gain, 0, 255)
-    rgb = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
-
-    out = rgba.copy()
-    out[:, :, :3] = rgb
-    return out
-
-
-def adjust_source_image(req: SourceAdjustRequest):
-    source = np.array(decode_data_url(req.source_data))
-    mode = (req.mode or "manual").strip()
-    adjusted = source
-    if mode in {"skin_align", "histogram_match"}:
-        if not req.target_data:
-            raise HTTPException(status_code=400, detail="这个调色方式需要目标图")
-        target = np.array(decode_data_url(req.target_data))
-        if mode == "histogram_match":
-            adjusted = histogram_match_rgba(adjusted, target, req.match_strength)
-        else:
-            adjusted = align_source_to_target_skin(adjusted, target, req.match_strength or 0.92)
-    elif mode != "manual":
-        raise HTTPException(status_code=400, detail=f"未知调色模式: {mode}")
-
-    adjusted = apply_source_manual_adjustments(
-        adjusted,
-        req.exposure,
-        req.brightness,
-        req.contrast,
-        req.temperature,
-        req.tint,
-        req.saturation,
-    )
-    return Image.fromarray(adjusted, "RGBA")
-
-
 def estimate_skin_fill(target_rgb, alpha_mask, skin_weight, skin_sample=None):
     if skin_sample:
         return np.array(skin_sample[:3], dtype=np.float32)
@@ -2268,20 +1821,15 @@ def color_match_patch(
     out_rgb = cv2.cvtColor(out_lab, cv2.COLOR_LAB2RGB).astype(np.float32)
 
     # Make imported skin disappear into the target while keeping dark brow strokes.
-    # Use a smoothed target skin field so old target brow texture is not copied back
-    # too strongly, but source-side orange/gray skin does not remain visible.
+    # This is closer to the PS workflow for eyebrow transfer than plain color shifting.
     alpha_frac = alpha.astype(np.float32) / 255.0
     skin_fill = estimate_skin_fill(target_rgb, alpha_mask, skin_weight, skin_sample)
     skin_fill_rgb = np.zeros_like(target_rgb, dtype=np.float32)
     skin_fill_rgb[:, :] = skin_fill
-    target_smooth = cv2.GaussianBlur(target_rgb.astype(np.float32), (0, 0), sigmaX=3.0, sigmaY=3.0)
-    skin_target_rgb = target_smooth * 0.65 + skin_fill_rgb * 0.35
     cover_weight = (old_brow_cover * skin_weight * alpha_frac)[..., None]
-    covered_target = skin_target_rgb * (1.0 - cover_weight) + skin_fill_rgb * cover_weight
+    covered_target = target_rgb.astype(np.float32) * (1.0 - cover_weight) + skin_fill_rgb * cover_weight
 
-    skin_fade_strength = np.clip(skin_tint * 1.15 + strength * 0.25, 0.0, 1.0)
-    skin_fade_weight = smoothstep(0.12, 0.72, skin_weight)
-    skin_fade = (skin_fade_strength * skin_fade_weight * alpha_frac)[..., None]
+    skin_fade = (skin_tint * skin_weight * alpha_frac)[..., None]
     out_rgb = out_rgb * (1.0 - skin_fade) + covered_target * skin_fade
     return np.clip(out_rgb, 0, 255).astype(np.uint8)
 
@@ -2346,8 +1894,18 @@ def poisson_blend(target_rgba, source_canvas, req: BlendRequest):
 
 
 def build_blend(req: BlendRequest):
+    source = np.array(decode_data_url(req.source_data))
     target = np.array(decode_data_url(req.target_data))
-    base_patch = build_base_patch(req)
+    mask_image = decode_data_url(req.source_mask_data)
+    source_mask = normalize_mask(mask_image, (source.shape[1], source.shape[0]))
+    source_mask = make_protected_soft_patch_mask(
+        source,
+        source_mask,
+        req.contract,
+        req.feather,
+        req.protect_dark,
+    )
+    base_patch = crop_patch(source, source_mask, pad=max(8, int(req.pad) + 12))
     placements = req.patches or [
         PatchPlacement(
             name="patch",
@@ -2405,30 +1963,6 @@ def safe_tuned_patch_name(name: str, source_name: str, target_name: str):
     return stem + ".png"
 
 
-def build_base_patch(req: BlendRequest):
-    if req.patch_data:
-        patch = np.array(decode_data_url(req.patch_data))
-        alpha = patch[:, :, 3]
-        if np.count_nonzero(alpha > 2) < 20:
-            raise HTTPException(status_code=400, detail="载入的贴片没有有效透明通道")
-        patch[:, :, :3][alpha == 0] = 0
-        return patch
-
-    if not req.source_data or not req.source_mask_data:
-        raise HTTPException(status_code=400, detail="请先载入贴片，或载入来源图并涂选区")
-    source = np.array(decode_data_url(req.source_data))
-    mask_image = decode_data_url(req.source_mask_data)
-    source_mask = normalize_mask(mask_image, (source.shape[1], source.shape[0]))
-    source_mask = make_protected_soft_patch_mask(
-        source,
-        source_mask,
-        req.contract,
-        req.feather,
-        req.protect_dark,
-    )
-    return crop_patch(source, source_mask, pad=max(8, int(req.pad) + 12))
-
-
 def build_export_patch(req: ExportPatchRequest):
     source = np.array(decode_data_url(req.source_data))
     mask_image = decode_data_url(req.source_mask_data)
@@ -2451,8 +1985,18 @@ def build_export_patch(req: ExportPatchRequest):
 
 
 def build_tuned_patch(req: BlendRequest):
+    source = np.array(decode_data_url(req.source_data))
     target = np.array(decode_data_url(req.target_data))
-    base_patch = build_base_patch(req)
+    mask_image = decode_data_url(req.source_mask_data)
+    source_mask = normalize_mask(mask_image, (source.shape[1], source.shape[0]))
+    source_mask = make_protected_soft_patch_mask(
+        source,
+        source_mask,
+        req.contract,
+        req.feather,
+        req.protect_dark,
+    )
+    base_patch = crop_patch(source, source_mask, pad=max(8, int(req.pad) + 12))
     placement = (req.patches or [
         PatchPlacement(name="patch", x=req.x, y=req.y, scale=req.scale, rotation=req.rotation, flip_x=req.flip_x)
     ])[0]
@@ -2491,39 +2035,6 @@ def load_path(req: PathRequest):
     if not path.exists() or not path.is_file():
         raise HTTPException(status_code=404, detail=f"文件不存在: {path}")
     return data_url_from_image(path)
-
-
-@app.post("/api/align_source_color")
-def align_source_color(req: ColorAlignRequest):
-    source = np.array(decode_data_url(req.source_data))
-    target = np.array(decode_data_url(req.target_data))
-    result = Image.fromarray(align_source_to_target_skin(source, target, req.strength), "RGBA")
-    source_stem = Path(req.source_name or "source").stem
-    name = re.sub(r"[\\/:*?\"<>|]+", "_", f"{source_stem}_aligned_to_target").strip() + ".png"
-    return {
-        "name": name,
-        "width": result.width,
-        "height": result.height,
-        "data_url": image_to_data_url(result),
-    }
-
-
-@app.post("/api/adjust_source")
-def adjust_source(req: SourceAdjustRequest):
-    result = adjust_source_image(req)
-    source_stem = Path(req.source_name or "source").stem
-    mode_label = {
-        "skin_align": "skin_matched",
-        "histogram_match": "hist_matched",
-        "manual": "adjusted",
-    }.get(req.mode, "adjusted")
-    name = re.sub(r"[\\/:*?\"<>|]+", "_", f"{source_stem}_{mode_label}").strip() + ".png"
-    return {
-        "name": name,
-        "width": result.width,
-        "height": result.height,
-        "data_url": image_to_data_url(result),
-    }
 
 
 @app.post("/api/blend")
