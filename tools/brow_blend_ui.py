@@ -1684,6 +1684,52 @@ def crop_rgba_by_region(rgb: np.ndarray, region_alpha: np.ndarray, pad=18):
     return out
 
 
+def brow_line_support(line_delta: np.ndarray, mask_float: np.ndarray, protect_dark: float):
+    inside = mask_float > 0.03
+    selected = line_delta[inside]
+    if selected.size < 20:
+        raise HTTPException(status_code=400, detail="来源选区太小，请多涂一点眉毛区域")
+
+    active = selected[selected > 0.5]
+    if active.size < 20:
+        return mask_float
+
+    h, w = line_delta.shape
+    size_scale = max(1.0, min(h, w) / 650.0)
+    low = max(1.0, float(np.percentile(active, 34 - 10 * protect_dark)))
+    high = max(low + 1.0, float(np.percentile(active, 58 - 18 * protect_dark)))
+    candidate = (line_delta >= low) & inside
+    strong = (line_delta >= high) & inside
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(strong.astype(np.uint8), 8)
+    kept = np.zeros_like(strong, dtype=np.uint8)
+    min_area = max(4, int(round(6 * size_scale * size_scale)))
+    min_long = max(7, int(round(9 * size_scale)))
+    for idx in range(1, num_labels):
+        area = int(stats[idx, cv2.CC_STAT_AREA])
+        bw = int(stats[idx, cv2.CC_STAT_WIDTH])
+        bh = int(stats[idx, cv2.CC_STAT_HEIGHT])
+        long_side = max(bw, bh)
+        short_side = max(1, min(bw, bh))
+        aspect = long_side / short_side
+        # Keep real brow strokes and stroke clusters, but drop round pore-like dots.
+        if area >= min_area or long_side >= min_long or (area >= 3 and aspect >= 2.8):
+            kept[labels == idx] = 1
+
+    if np.count_nonzero(kept) < 8:
+        return mask_float
+
+    grow = max(1, int(round((2.0 + 2.5 * protect_dark) * size_scale)))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (grow * 2 + 1, grow * 2 + 1))
+    support = cv2.dilate(kept, kernel, iterations=1).astype(bool) & candidate
+    if np.count_nonzero(support) < 12:
+        return mask_float
+
+    support_float = cv2.GaussianBlur(support.astype(np.float32), (0, 0), sigmaX=max(0.7, grow / 2.0))
+    support_float = np.clip(support_float, 0.0, 1.0)
+    return support_float * mask_float
+
+
 def decontaminate_hair_patch(source_rgba: np.ndarray, alpha: np.ndarray):
     rgb = source_rgba[:, :, :3].astype(np.float32)
     gray = cv2.cvtColor(source_rgba[:, :, :3].astype(np.uint8), cv2.COLOR_RGB2GRAY)
@@ -1758,6 +1804,7 @@ def white_bg_brow_patch(source_rgba: np.ndarray, source_mask: np.ndarray, protec
     noise_floor = max(1.0, float(np.percentile(selected_delta, 42)) * (0.34 - 0.20 * protect_dark))
     detail_gain = 1.55 + 1.20 * protect_dark
     line_delta = np.maximum(dark_delta - noise_floor, 0.0) * detail_gain
+    line_delta *= brow_line_support(line_delta, mask_float, protect_dark)
 
     rgb = source_rgba[:, :, :3].astype(np.float32)
     channel_bg = []
