@@ -776,8 +776,12 @@ HTML = r"""<!doctype html>
       targetCanvas.width = targetHitCanvas.width = w;
       targetCanvas.height = targetHitCanvas.height = h;
       targetCtx.clearRect(0, 0, w, h);
-      targetCtx.drawImage(targetImage, 0, 0, w, h);
-      drawFastPatchPreview();
+      if (targetPreviewImage && hasPreview && !options.fast) {
+        targetCtx.drawImage(targetPreviewImage, 0, 0, w, h);
+      } else {
+        targetCtx.drawImage(targetImage, 0, 0, w, h);
+        drawFastPatchPreview();
+      }
       drawTargetMarker();
       updateLabels();
     }
@@ -1316,6 +1320,12 @@ HTML = r"""<!doctype html>
         resultImg.src = data.data_url;
         resultImg.style.display = 'block';
         hasPreview = true;
+        const finePreview = new Image();
+        finePreview.onload = () => {
+          targetPreviewImage = finePreview;
+          redrawTarget();
+        };
+        finePreview.src = data.data_url;
         const saved = data.path ? `<br><strong>保存：</strong>${data.path}` : '<br><strong>状态：</strong>仅预览，未保存';
         setStatus(`<strong>输出：</strong>${data.width} x ${data.height}${saved}`);
       } finally {
@@ -1858,6 +1868,7 @@ def alpha_blend(target_rgba, source_canvas, req: BlendRequest):
 
 def embroidery_layered_blend(target_rgba, source_canvas, req: BlendRequest):
     target_rgb = target_rgba[:, :, :3].astype(np.float32)
+    source_rgb = source_canvas[:, :, :3].astype(np.uint8)
     alpha = source_canvas[:, :, 3]
     if np.count_nonzero(alpha > 8) < 20:
         return target_rgba
@@ -1869,31 +1880,51 @@ def embroidery_layered_blend(target_rgba, source_canvas, req: BlendRequest):
 
     opacity = max(0.0, min(float(req.opacity), 1.0))
     protect = max(0.0, min(float(req.protect_dark), 1.0))
+    color_strength = max(0.0, min(float(req.color_match), 1.0))
+    skin_strength = max(0.0, min(float(req.skin_tint), 1.0))
     region = alpha > 8
     region_frac = np.clip(alpha.astype(np.float32) / 255.0 * opacity, 0.0, 1.0)
     line_frac = np.clip(line_alpha.astype(np.float32) / 255.0 * opacity, 0.0, 1.0)
-    line_frac = np.clip(np.power(line_frac, 0.88) * (0.72 + 0.28 * protect), 0.0, 1.0)
+    line_frac = np.clip(np.power(line_frac, 0.72 + 0.42 * (1.0 - protect)) * (0.38 + 0.62 * protect), 0.0, 1.0)
 
-    skin_fade_strength = max(0.0, min(float(req.skin_tint), 1.0)) * 0.38
-    line_guard = smoothstep(0.10, 0.58, line_frac)
-    skin_alpha = np.clip(region_frac * (1.0 - line_guard) * skin_fade_strength, 0.0, 0.42)
+    line_guard = smoothstep(0.08, 0.46, line_frac)
+    non_line = np.clip(1.0 - line_guard, 0.0, 1.0)
+
+    matched_source = color_match_patch(
+        source_rgb,
+        target_rgba[:, :, :3],
+        alpha,
+        color_strength,
+        protect,
+        req.skin_sample,
+        skin_strength * 0.45,
+        0.0,
+    ).astype(np.float32)
 
     skin_fill = estimate_skin_fill(
         target_rgba[:, :, :3],
         region,
-        skin_alpha,
+        non_line,
         req.skin_sample,
     )
     skin_fill_rgb = np.zeros_like(target_rgb)
     skin_fill_rgb[:, :] = skin_fill
-    target_smooth = cv2.GaussianBlur(target_rgb, (0, 0), sigmaX=2.4, sigmaY=2.4)
-    target_skin = target_smooth * 0.72 + skin_fill_rgb * 0.28
+    target_smooth = cv2.GaussianBlur(target_rgb, (0, 0), sigmaX=2.6, sigmaY=2.6)
+    target_skin = target_smooth * 0.70 + skin_fill_rgb * 0.30
 
-    out_rgb = target_rgb * (1.0 - skin_alpha[..., None]) + target_skin * skin_alpha[..., None]
+    # In this experimental mode the right-side sliders are intentionally direct:
+    # color_match controls how much source skin is discarded, skin_tint controls
+    # how strongly the target skin under the patch is rebuilt, protect_dark keeps
+    # fine dark brow strokes from being weakened.
+    source_skin_alpha = np.clip(region_frac * non_line * (1.0 - color_strength) * (0.70 - 0.35 * skin_strength), 0.0, 0.65)
+    skin_alpha = np.clip(region_frac * non_line * skin_strength * (0.30 + 0.70 * color_strength), 0.0, 0.82)
+
+    out_rgb = target_rgb * (1.0 - source_skin_alpha[..., None]) + matched_source * source_skin_alpha[..., None]
+    out_rgb = out_rgb * (1.0 - skin_alpha[..., None]) + target_skin * skin_alpha[..., None]
 
     hair_rgba = decontaminate_hair_patch(source_canvas, line_alpha)
     hair_rgb = hair_rgba[:, :, :3].astype(np.float32)
-    hair_strength = np.clip(line_frac * (0.86 + 0.14 * protect), 0.0, 1.0)
+    hair_strength = np.clip(line_frac * (0.52 + 0.48 * protect) * (0.82 + 0.18 * opacity), 0.0, 1.0)
     out_rgb = hair_rgb * hair_strength[..., None] + out_rgb * (1.0 - hair_strength[..., None])
 
     out = target_rgba.copy()
