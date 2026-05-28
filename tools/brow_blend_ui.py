@@ -418,7 +418,7 @@ HTML = r"""<!doctype html>
         <input id="patchOutputDir" type="text" value="/media/jinsha/娱乐1/眉毛/眉毛贴片库" />
         <label>贴片文件名</label>
         <input id="patchOutputName" type="text" placeholder="留空自动命名" />
-        <button class="primary" id="savePatchBtn" style="width:100%; margin-top:10px;">保存透明眉毛贴片</button>
+        <button class="primary" id="savePatchBtn" style="width:100%; margin-top:10px;">保存眉毛贴片素材</button>
         <button class="ok" id="saveTunedPatchBtn" style="width:100%; margin-top:10px;">保存当前调好贴片</button>
       </div>
     </aside>
@@ -1671,6 +1671,24 @@ def crop_rgb_by_mask(rgb: np.ndarray, mask: np.ndarray, pad=18):
     return rgb[y1:y2, x1:x2].copy()
 
 
+def crop_rgba_by_region(rgb: np.ndarray, region_alpha: np.ndarray, pad=18):
+    ys, xs = np.where(region_alpha > 2)
+    if not len(xs):
+        raise HTTPException(status_code=400, detail="来源选区为空，请先涂眉毛区域")
+    h, w = region_alpha.shape
+    x1 = max(0, int(xs.min()) - pad)
+    y1 = max(0, int(ys.min()) - pad)
+    x2 = min(w, int(xs.max()) + pad + 1)
+    y2 = min(h, int(ys.max()) + pad + 1)
+    cropped_rgb = rgb[y1:y2, x1:x2].copy()
+    cropped_alpha = region_alpha[y1:y2, x1:x2].copy()
+    out = np.zeros((cropped_rgb.shape[0], cropped_rgb.shape[1], 4), dtype=np.uint8)
+    out[:, :, :3] = cropped_rgb
+    out[:, :, 3] = cropped_alpha
+    out[:, :, :3][cropped_alpha == 0] = 255
+    return out
+
+
 def decontaminate_hair_patch(source_rgba: np.ndarray, alpha: np.ndarray):
     rgb = source_rgba[:, :, :3].astype(np.float32)
     gray = cv2.cvtColor(source_rgba[:, :, :3].astype(np.uint8), cv2.COLOR_RGB2GRAY)
@@ -1725,6 +1743,9 @@ def hair_line_alpha(source_rgba: np.ndarray, region_mask: np.ndarray):
 
 def white_bg_brow_patch(source_rgba: np.ndarray, source_mask: np.ndarray, protect_dark: float):
     region_mask = make_patch_region_mask(source_mask, 0)
+    painted_region_alpha = np.clip(source_mask.astype(np.float32), 0, 255)
+    painted_region_alpha = cv2.GaussianBlur(painted_region_alpha, (3, 3), 0)
+    painted_region_alpha = np.clip(painted_region_alpha, 0, 255).astype(np.uint8)
     protect_dark = max(0.0, min(float(protect_dark), 1.0))
 
     rgb_u8 = source_rgba[:, :, :3].astype(np.uint8)
@@ -1778,8 +1799,8 @@ def white_bg_brow_patch(source_rgba: np.ndarray, source_mask: np.ndarray, protec
     clean_line_rgb = hair_color.reshape(1, 1, 3) * (1.0 - preserve_original) + rgb * preserve_original
     white = np.full_like(rgb, 255.0)
     out_rgb = white * (1.0 - a[..., None]) + clean_line_rgb * a[..., None]
-    out_rgb[region_mask <= 2] = 255.0
-    return crop_rgb_by_mask(np.clip(out_rgb, 0, 255).astype(np.uint8), alpha, pad=24)
+    out_rgb[painted_region_alpha <= 2] = 255.0
+    return crop_rgba_by_region(np.clip(out_rgb, 0, 255).astype(np.uint8), painted_region_alpha, pad=24)
 
 
 def transform_patch(patch: np.ndarray, scale: float, rotation: float, flip_x: bool = False):
@@ -2046,7 +2067,7 @@ def build_export_patch(req: ExportPatchRequest):
     source_mask = normalize_mask(mask_image, (source.shape[1], source.shape[0]))
 
     if req.patch_mode == "white_bg":
-        return Image.fromarray(white_bg_brow_patch(source, source_mask, req.protect_dark), "RGB")
+        return Image.fromarray(white_bg_brow_patch(source, source_mask, req.protect_dark), "RGBA")
 
     if req.patch_mode == "soft_patch":
         adjusted_mask = make_protected_soft_patch_mask(
