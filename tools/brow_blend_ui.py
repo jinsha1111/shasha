@@ -23,11 +23,6 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from PIL import Image, ImageOps
 
-try:
-    from skimage.filters import frangi
-except Exception:  # pragma: no cover - optional refinement dependency
-    frangi = None
-
 
 DEFAULT_OUTPUT_DIR = Path("/media/jinsha/娱乐1/眉毛/换眉输出")
 DEFAULT_PATCH_DIR = Path("/media/jinsha/娱乐1/眉毛/眉毛贴片库")
@@ -1760,45 +1755,25 @@ def white_bg_brow_patch(source_rgba: np.ndarray, source_mask: np.ndarray, protec
     selected_delta = dark_delta[mask_float > 0.03]
     if selected_delta.size < 20:
         raise HTTPException(status_code=400, detail="来源选区太小，请多涂一点眉毛区域")
-    edge0 = max(3.0, float(np.percentile(selected_delta, 58)) * 0.40)
-    edge1 = max(edge0 + 16.0, float(np.percentile(selected_delta, 96)) * (0.72 + 0.18 * protect_dark))
-    alpha_frac = smoothstep(edge0, edge1, dark_delta) * mask_float
-    if frangi is not None and np.max(dark_delta) > 1:
-        try:
-            ridge_input = np.clip(dark_delta / max(float(np.percentile(dark_delta[mask_float > 0.03], 99)), 1.0), 0.0, 1.0)
-            ridge = frangi(ridge_input, sigmas=(0.8, 1.2, 1.8, 2.6), black_ridges=False)
-            ridge = np.nan_to_num(ridge, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
-            ridge_selected = ridge[mask_float > 0.03]
-            if ridge_selected.size >= 20 and float(ridge_selected.max()) > 0:
-                r0 = float(np.percentile(ridge_selected, 64))
-                r1 = max(r0 + 1e-6, float(np.percentile(ridge_selected, 98)))
-                ridge_weight = smoothstep(r0, r1, ridge)
-                alpha_frac *= np.clip(0.08 + 0.92 * ridge_weight, 0.0, 1.0)
-        except Exception:
-            pass
-    alpha_frac = np.power(alpha_frac, 0.72 - 0.22 * protect_dark)
-    alpha_frac = cv2.GaussianBlur(alpha_frac.astype(np.float32), (3, 3), 0)
-    alpha = np.clip(alpha_frac * 255.0, 0, 255).astype(np.uint8)
+    noise_floor = max(1.0, float(np.percentile(selected_delta, 42)) * (0.34 - 0.20 * protect_dark))
+    detail_gain = 1.55 + 1.20 * protect_dark
+    line_delta = np.maximum(dark_delta - noise_floor, 0.0) * detail_gain
 
     rgb = source_rgba[:, :, :3].astype(np.float32)
-    strong = alpha > 90
-    if np.count_nonzero(strong) < 20:
-        strong = alpha > 35
-    if np.count_nonzero(strong) >= 20:
-        gray = cv2.cvtColor(source_rgba[:, :, :3].astype(np.uint8), cv2.COLOR_RGB2GRAY)
-        dark_cutoff = np.percentile(gray[strong], 65)
-        hair_pixels = strong & (gray <= dark_cutoff)
-        if np.count_nonzero(hair_pixels) < 10:
-            hair_pixels = strong
-        hair_color = np.median(rgb[hair_pixels], axis=0)
-    else:
-        hair_color = np.array([70.0, 62.0, 58.0], dtype=np.float32)
+    channel_bg = []
+    for c in range(3):
+        bg = cv2.morphologyEx(rgb_u8[:, :, c], cv2.MORPH_CLOSE, kernel).astype(np.float32)
+        bg = cv2.GaussianBlur(bg, (0, 0), sigmaX=max(2.0, ksize / 7.0), sigmaY=max(2.0, ksize / 7.0))
+        channel_bg.append(bg)
+    local_bg_rgb = np.stack(channel_bg, axis=2)
+    color_delta = np.maximum(local_bg_rgb - rgb, 0.0)
+    color_sum = color_delta.sum(axis=2, keepdims=True)
+    tint = np.divide(color_delta, np.maximum(color_sum, 1.0), out=np.zeros_like(color_delta), where=color_sum > 1.0)
+    neutral_tint = np.full_like(tint, 1.0 / 3.0)
+    tint = tint * 0.58 + neutral_tint * 0.42
 
-    a = alpha.astype(np.float32) / 255.0
-    preserve_original = smoothstep(0.52, 0.95, a)[..., None]
-    clean_line_rgb = hair_color.reshape(1, 1, 3) * (1.0 - preserve_original) + rgb * preserve_original
     white = np.full_like(rgb, 255.0)
-    out_rgb = white * (1.0 - a[..., None]) + clean_line_rgb * a[..., None]
+    out_rgb = white - line_delta[..., None] * tint * 3.0
     out_rgb[painted_region_alpha <= 2] = 255.0
     return crop_rgba_by_region(np.clip(out_rgb, 0, 255).astype(np.uint8), painted_region_alpha, pad=24)
 
