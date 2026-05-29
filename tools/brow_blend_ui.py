@@ -283,7 +283,7 @@ HTML = r"""<!doctype html>
           <button id="fitSource">适合窗口</button>
         </div>
         <div class="row" style="margin-top:8px;">
-          <button class="ok" id="whiteSourceBtn">选区白底化来源</button>
+          <button class="ok" id="whiteSourceBtn">PS除底白底化选区</button>
           <button id="restoreSourceBtn">还原来源</button>
         </div>
         <label>浏览器选择来源</label>
@@ -893,7 +893,7 @@ HTML = r"""<!doctype html>
         setStatus('先用画笔圈住眉毛区域，再做选区白底化。不要整张脸白底化。');
         return;
       }
-      setStatus('正在把选中的眉毛区域转成纯白底线稿...');
+      setStatus('正在用PS除底法处理选中的眉毛区域...');
       document.getElementById('whiteSourceBtn').disabled = true;
       try {
         const resp = await fetch('/api/white_source', {
@@ -1792,38 +1792,51 @@ def brow_line_support(line_delta: np.ndarray, mask_float: np.ndarray, protect_da
     return support_float * mask_float
 
 
-def white_background_line_art(source_rgba: np.ndarray, protect_dark: float):
+def white_background_line_art(source_rgba: np.ndarray, protect_dark: float, level_mask: Optional[np.ndarray] = None):
     protect_dark = max(0.0, min(float(protect_dark), 1.0))
     rgb_u8 = source_rgba[:, :, :3].astype(np.uint8)
     gray = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2GRAY).astype(np.float32)
     h, w = gray.shape
-    ksize = max(31, min(151, int(round(min(h, w) * 0.055)) | 1))
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
-    local_bg = cv2.morphologyEx(gray.astype(np.uint8), cv2.MORPH_CLOSE, kernel).astype(np.float32)
-    local_bg = cv2.GaussianBlur(
-        local_bg,
+
+    # Photoshop-style "divide background" workflow:
+    # estimate the underlying skin/paper tone, divide the original luminance by
+    # that tone, then push near-background values to pure white with levels.
+    # This keeps the original stroke shapes instead of redetecting/repainting them.
+    base = max(25, int(round(min(h, w) * 0.22)) | 1)
+    base = min(base, 301)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (base, base))
+    background = cv2.morphologyEx(gray.astype(np.uint8), cv2.MORPH_CLOSE, kernel).astype(np.float32)
+    background = cv2.GaussianBlur(
+        background,
         (0, 0),
-        sigmaX=max(3.0, ksize / 6.0),
-        sigmaY=max(3.0, ksize / 6.0),
+        sigmaX=max(4.0, base / 5.0),
+        sigmaY=max(4.0, base / 5.0),
     )
-    dark_delta = np.maximum(local_bg - gray, 0.0)
-    active = dark_delta[dark_delta > 0.75]
-    if active.size < 20:
-        out = np.full((h, w, 4), 255, dtype=np.uint8)
-        out[:, :, 3] = source_rgba[:, :, 3]
-        return out
+    divided = gray / np.maximum(background, 1.0) * 255.0
+    divided = np.clip(divided, 0.0, 255.0)
 
-    # A higher floor removes skin pores and freckles; protect_dark pulls back
-    # toward fine-stroke retention when the user needs softer hair tips.
-    noise_floor = max(2.0, float(np.percentile(active, 48)) * (0.98 - 0.42 * protect_dark))
-    line_delta = np.maximum(dark_delta - noise_floor, 0.0) * (1.55 + 1.15 * protect_dark)
-    line_delta *= brow_line_support(line_delta, np.ones_like(gray, dtype=np.float32), protect_dark)
-
-    weak_cut = max(1.0, float(np.percentile(line_delta[line_delta > 0.1], 18)) if np.any(line_delta > 0.1) else 1.0)
-    line_delta[line_delta < weak_cut] = 0.0
-    out_gray = 255.0 - np.clip(line_delta * 2.75, 0.0, 245.0)
-    out_gray[out_gray > 250.0] = 255.0
-    out_rgb = np.repeat(out_gray[:, :, None], 3, axis=2).astype(np.uint8)
+    if level_mask is not None:
+        mask_values = divided[np.clip(level_mask.astype(np.float32) / 255.0, 0.0, 1.0) > 0.03]
+        values = mask_values if mask_values.size >= 20 else divided.reshape(-1)
+    else:
+        values = divided.reshape(-1)
+    black_point = float(np.percentile(values, 0.6 + 2.4 * (1.0 - protect_dark)))
+    white_point = float(np.percentile(values, 70.0 + 23.0 * protect_dark))
+    white_point = max(black_point + 24.0, min(252.0, white_point))
+    leveled = np.clip((divided - black_point) / (white_point - black_point), 0.0, 1.0)
+    gamma = 1.05 + 0.65 * protect_dark
+    out_gray = np.power(leveled, gamma) * 255.0
+    # Lower brow protection means "clean the paper/skin harder"; higher values
+    # keep weaker hair tips by requiring pixels to be closer to white before
+    # they are forced to pure white.
+    out_gray[out_gray >= (180.0 + 30.0 * protect_dark)] = 255.0
+    core = out_gray <= (85.0 + 38.0 * protect_dark)
+    if np.count_nonzero(core) >= 10:
+        grow = max(5, int(round(min(h, w) * (0.055 + 0.035 * protect_dark))))
+        support_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (grow * 2 + 1, grow * 2 + 1))
+        support = cv2.dilate(core.astype(np.uint8), support_kernel, iterations=1).astype(bool)
+        out_gray[(out_gray < 255.0) & (~support) & (~core)] = 255.0
+    out_rgb = np.repeat(np.clip(out_gray, 0, 255).astype(np.uint8)[:, :, None], 3, axis=2)
     out = np.zeros((h, w, 4), dtype=np.uint8)
     out[:, :, :3] = out_rgb
     out[:, :, 3] = source_rgba[:, :, 3]
@@ -1846,7 +1859,7 @@ def selected_white_background_line_art(source_rgba: np.ndarray, source_mask: np.
     crop_mask = region_mask[y1:y2, x1:x2]
     mask_float = np.clip(crop_mask.astype(np.float32) / 255.0, 0.0, 1.0)
 
-    line_art = white_background_line_art(crop, protect_dark)
+    line_art = white_background_line_art(crop, protect_dark, crop_mask)
     # Keep only the manually selected brow neighborhood. Everything else becomes
     # pure white so multiply mode has no rectangular edge or face texture.
     outside = mask_float <= 0.02
@@ -1912,8 +1925,6 @@ def white_bg_brow_patch(source_rgba: np.ndarray, source_mask: np.ndarray, protec
     painted_region_alpha = np.clip(source_mask.astype(np.float32), 0, 255)
     painted_region_alpha = cv2.GaussianBlur(painted_region_alpha, (3, 3), 0)
     painted_region_alpha = np.clip(painted_region_alpha, 0, 255).astype(np.uint8)
-    protect_dark = max(0.0, min(float(protect_dark), 1.0))
-
     rgb_u8 = source_rgba[:, :, :3].astype(np.uint8)
     gray = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2GRAY).astype(np.float32)
     mask_float = np.clip(region_mask.astype(np.float32) / 255.0, 0.0, 1.0)
@@ -1922,37 +1933,7 @@ def white_bg_brow_patch(source_rgba: np.ndarray, source_mask: np.ndarray, protec
         direct_rgb = rgb_u8.copy()
         direct_rgb[painted_region_alpha <= 2] = 255
         return crop_rgba_by_region(direct_rgb, painted_region_alpha, pad=24)
-    h, w = gray.shape
-    ksize = max(21, min(91, int(round(min(h, w) * 0.065)) | 1))
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
-    local_bg = cv2.morphologyEx(gray.astype(np.uint8), cv2.MORPH_CLOSE, kernel).astype(np.float32)
-    local_bg = cv2.GaussianBlur(local_bg, (0, 0), sigmaX=max(2.0, ksize / 7.0), sigmaY=max(2.0, ksize / 7.0))
-    dark_delta = np.maximum(local_bg - gray, 0.0)
-    selected_delta = dark_delta[mask_float > 0.03]
-    if selected_delta.size < 20:
-        raise HTTPException(status_code=400, detail="来源选区太小，请多涂一点眉毛区域")
-    noise_floor = max(1.0, float(np.percentile(selected_delta, 42)) * (0.34 - 0.20 * protect_dark))
-    detail_gain = 1.55 + 1.20 * protect_dark
-    line_delta = np.maximum(dark_delta - noise_floor, 0.0) * detail_gain
-    line_delta *= brow_line_support(line_delta, mask_float, protect_dark)
-
-    rgb = source_rgba[:, :, :3].astype(np.float32)
-    channel_bg = []
-    for c in range(3):
-        bg = cv2.morphologyEx(rgb_u8[:, :, c], cv2.MORPH_CLOSE, kernel).astype(np.float32)
-        bg = cv2.GaussianBlur(bg, (0, 0), sigmaX=max(2.0, ksize / 7.0), sigmaY=max(2.0, ksize / 7.0))
-        channel_bg.append(bg)
-    local_bg_rgb = np.stack(channel_bg, axis=2)
-    color_delta = np.maximum(local_bg_rgb - rgb, 0.0)
-    color_sum = color_delta.sum(axis=2, keepdims=True)
-    tint = np.divide(color_delta, np.maximum(color_sum, 1.0), out=np.zeros_like(color_delta), where=color_sum > 1.0)
-    neutral_tint = np.full_like(tint, 1.0 / 3.0)
-    tint = tint * 0.58 + neutral_tint * 0.42
-
-    white = np.full_like(rgb, 255.0)
-    out_rgb = white - line_delta[..., None] * tint * 3.0
-    out_rgb[painted_region_alpha <= 2] = 255.0
-    return crop_rgba_by_region(np.clip(out_rgb, 0, 255).astype(np.uint8), painted_region_alpha, pad=24)
+    return selected_white_background_line_art(source_rgba, source_mask, protect_dark)
 
 
 def transform_patch(patch: np.ndarray, scale: float, rotation: float, flip_x: bool = False):
