@@ -283,7 +283,7 @@ HTML = r"""<!doctype html>
           <button id="fitSource">适合窗口</button>
         </div>
         <div class="row" style="margin-top:8px;">
-          <button class="ok" id="whiteSourceBtn">一键白底化来源</button>
+          <button class="ok" id="whiteSourceBtn">选区白底化来源</button>
           <button id="restoreSourceBtn">还原来源</button>
         </div>
         <label>浏览器选择来源</label>
@@ -822,6 +822,10 @@ HTML = r"""<!doctype html>
           maskCanvas.width = img.naturalWidth;
           maskCanvas.height = img.naturalHeight;
           maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
+          if (opts.fillMask) {
+            maskCtx.fillStyle = 'rgba(255,255,255,1)';
+            maskCtx.fillRect(0, 0, maskCanvas.width, maskCanvas.height);
+          }
           maskBBoxCache = null;
           invalidatePreview();
           undoStack = [];
@@ -885,7 +889,11 @@ HTML = r"""<!doctype html>
         setStatus('请先载入来源图。');
         return;
       }
-      setStatus('正在把来源图转成纯白底线稿...');
+      if (!getMaskBBox()) {
+        setStatus('先用画笔圈住眉毛区域，再做选区白底化。不要整张脸白底化。');
+        return;
+      }
+      setStatus('正在把选中的眉毛区域转成纯白底线稿...');
       document.getElementById('whiteSourceBtn').disabled = true;
       try {
         const resp = await fetch('/api/white_source', {
@@ -893,6 +901,7 @@ HTML = r"""<!doctype html>
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({
             source_data: sourceData,
+            source_mask_data: maskCanvas.toDataURL('image/png'),
             source_name: sourceName,
             protect_dark: Number(document.getElementById('protectDark').value) / 100
           })
@@ -902,8 +911,8 @@ HTML = r"""<!doctype html>
           setStatus(data.detail || '白底化失败');
           return;
         }
-        loadImageData(data.data_url, data.name, 'source', { keepOriginal: true });
-        setStatus(`<strong>来源已白底化：</strong>${data.width} x ${data.height}。现在圈眉毛区域保存贴片。`);
+        loadImageData(data.data_url, data.name, 'source', { keepOriginal: true, fillMask: true });
+        setStatus(`<strong>选区已白底化：</strong>${data.width} x ${data.height}。现在可以直接保存白底贴片。`);
       } finally {
         document.getElementById('whiteSourceBtn').disabled = false;
       }
@@ -1520,6 +1529,7 @@ class ExportPatchRequest(BaseModel):
 
 class WhiteSourceRequest(BaseModel):
     source_data: str
+    source_mask_data: str = ""
     source_name: str = "source"
     protect_dark: float = 0.70
 
@@ -1818,6 +1828,31 @@ def white_background_line_art(source_rgba: np.ndarray, protect_dark: float):
     out[:, :, :3] = out_rgb
     out[:, :, 3] = source_rgba[:, :, 3]
     return out
+
+
+def selected_white_background_line_art(source_rgba: np.ndarray, source_mask: np.ndarray, protect_dark: float):
+    region_mask = make_patch_region_mask(source_mask, 0)
+    ys, xs = np.where(region_mask > 5)
+    if xs.size == 0 or ys.size == 0:
+        raise HTTPException(status_code=400, detail="来源选区为空，请先圈住眉毛区域")
+
+    pad = 24
+    h, w = region_mask.shape
+    x1 = max(0, int(xs.min()) - pad)
+    y1 = max(0, int(ys.min()) - pad)
+    x2 = min(w, int(xs.max()) + pad + 1)
+    y2 = min(h, int(ys.max()) + pad + 1)
+    crop = source_rgba[y1:y2, x1:x2].copy()
+    crop_mask = region_mask[y1:y2, x1:x2]
+    mask_float = np.clip(crop_mask.astype(np.float32) / 255.0, 0.0, 1.0)
+
+    line_art = white_background_line_art(crop, protect_dark)
+    # Keep only the manually selected brow neighborhood. Everything else becomes
+    # pure white so multiply mode has no rectangular edge or face texture.
+    outside = mask_float <= 0.02
+    line_art[:, :, :3][outside] = 255
+    line_art[:, :, 3] = 255
+    return line_art
 
 
 def decontaminate_hair_patch(source_rgba: np.ndarray, alpha: np.ndarray):
@@ -2258,7 +2293,13 @@ def load_path(req: PathRequest):
 @app.post("/api/white_source")
 def white_source(req: WhiteSourceRequest):
     source = np.array(decode_data_url(req.source_data))
-    result = Image.fromarray(white_background_line_art(source, req.protect_dark), "RGBA")
+    if req.source_mask_data:
+        mask_image = decode_data_url(req.source_mask_data)
+        source_mask = normalize_mask(mask_image, (source.shape[1], source.shape[0]))
+        result_arr = selected_white_background_line_art(source, source_mask, req.protect_dark)
+    else:
+        result_arr = white_background_line_art(source, req.protect_dark)
+    result = Image.fromarray(result_arr, "RGBA")
     stem = re.sub(r"[\\/:*?\"<>|]+", "_", Path(req.source_name).stem).strip() or "source"
     return {
         "name": f"{stem}_white_bg.png",
