@@ -282,6 +282,10 @@ HTML = r"""<!doctype html>
           <button class="primary" id="loadSourcePath">打开来源</button>
           <button id="fitSource">适合窗口</button>
         </div>
+        <div class="row" style="margin-top:8px;">
+          <button class="ok" id="whiteSourceBtn">一键白底化来源</button>
+          <button id="restoreSourceBtn">还原来源</button>
+        </div>
         <label>浏览器选择来源</label>
         <input id="sourceFile" type="file" accept="image/*" />
       </div>
@@ -440,6 +444,8 @@ HTML = r"""<!doctype html>
     let sourceImage = null;
     let targetImage = null;
     let sourceData = '';
+    let sourceOriginalData = '';
+    let sourceOriginalName = '';
     let targetData = '';
     let targetPreviewImage = null;
     let sourceName = 'source';
@@ -802,13 +808,17 @@ HTML = r"""<!doctype html>
       targetHitCtx.restore();
     }
 
-    function loadImageData(dataUrl, name, kind) {
+    function loadImageData(dataUrl, name, kind, opts = {}) {
       const img = new Image();
       img.onload = () => {
         if (kind === 'source') {
           sourceImage = img;
           sourceData = dataUrl;
           sourceName = name || 'source';
+          if (!opts.keepOriginal) {
+            sourceOriginalData = dataUrl;
+            sourceOriginalName = sourceName;
+          }
           maskCanvas.width = img.naturalWidth;
           maskCanvas.height = img.naturalHeight;
           maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
@@ -862,6 +872,42 @@ HTML = r"""<!doctype html>
     document.getElementById('loadTargetPath').onclick = () => loadPath(document.getElementById('targetPath').value.trim(), 'target');
     document.getElementById('fitSource').onclick = () => { setVal('sourceZoom', 100); redrawSource(); };
     document.getElementById('fitTarget').onclick = () => redrawTarget();
+    document.getElementById('restoreSourceBtn').onclick = () => {
+      if (!sourceOriginalData) {
+        setStatus('没有可还原的来源图。');
+        return;
+      }
+      loadImageData(sourceOriginalData, sourceOriginalName, 'source', { keepOriginal: true });
+      setStatus('已还原来源图。');
+    };
+    document.getElementById('whiteSourceBtn').onclick = async () => {
+      if (!sourceImage) {
+        setStatus('请先载入来源图。');
+        return;
+      }
+      setStatus('正在把来源图转成纯白底线稿...');
+      document.getElementById('whiteSourceBtn').disabled = true;
+      try {
+        const resp = await fetch('/api/white_source', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            source_data: sourceData,
+            source_name: sourceName,
+            protect_dark: Number(document.getElementById('protectDark').value) / 100
+          })
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+          setStatus(data.detail || '白底化失败');
+          return;
+        }
+        loadImageData(data.data_url, data.name, 'source', { keepOriginal: true });
+        setStatus(`<strong>来源已白底化：</strong>${data.width} x ${data.height}。现在圈眉毛区域保存贴片。`);
+      } finally {
+        document.getElementById('whiteSourceBtn').disabled = false;
+      }
+    };
 
     function readFileInput(input, kind) {
       const file = input.files && input.files[0];
@@ -1472,6 +1518,12 @@ class ExportPatchRequest(BaseModel):
     save: bool = True
 
 
+class WhiteSourceRequest(BaseModel):
+    source_data: str
+    source_name: str = "source"
+    protect_dark: float = 0.70
+
+
 app = FastAPI(title="PS-style eyebrow patch blending UI")
 
 
@@ -1730,6 +1782,44 @@ def brow_line_support(line_delta: np.ndarray, mask_float: np.ndarray, protect_da
     return support_float * mask_float
 
 
+def white_background_line_art(source_rgba: np.ndarray, protect_dark: float):
+    protect_dark = max(0.0, min(float(protect_dark), 1.0))
+    rgb_u8 = source_rgba[:, :, :3].astype(np.uint8)
+    gray = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    h, w = gray.shape
+    ksize = max(31, min(151, int(round(min(h, w) * 0.055)) | 1))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+    local_bg = cv2.morphologyEx(gray.astype(np.uint8), cv2.MORPH_CLOSE, kernel).astype(np.float32)
+    local_bg = cv2.GaussianBlur(
+        local_bg,
+        (0, 0),
+        sigmaX=max(3.0, ksize / 6.0),
+        sigmaY=max(3.0, ksize / 6.0),
+    )
+    dark_delta = np.maximum(local_bg - gray, 0.0)
+    active = dark_delta[dark_delta > 0.75]
+    if active.size < 20:
+        out = np.full((h, w, 4), 255, dtype=np.uint8)
+        out[:, :, 3] = source_rgba[:, :, 3]
+        return out
+
+    # A higher floor removes skin pores and freckles; protect_dark pulls back
+    # toward fine-stroke retention when the user needs softer hair tips.
+    noise_floor = max(2.0, float(np.percentile(active, 48)) * (0.98 - 0.42 * protect_dark))
+    line_delta = np.maximum(dark_delta - noise_floor, 0.0) * (1.55 + 1.15 * protect_dark)
+    line_delta *= brow_line_support(line_delta, np.ones_like(gray, dtype=np.float32), protect_dark)
+
+    weak_cut = max(1.0, float(np.percentile(line_delta[line_delta > 0.1], 18)) if np.any(line_delta > 0.1) else 1.0)
+    line_delta[line_delta < weak_cut] = 0.0
+    out_gray = 255.0 - np.clip(line_delta * 2.75, 0.0, 245.0)
+    out_gray[out_gray > 250.0] = 255.0
+    out_rgb = np.repeat(out_gray[:, :, None], 3, axis=2).astype(np.uint8)
+    out = np.zeros((h, w, 4), dtype=np.uint8)
+    out[:, :, :3] = out_rgb
+    out[:, :, 3] = source_rgba[:, :, 3]
+    return out
+
+
 def decontaminate_hair_patch(source_rgba: np.ndarray, alpha: np.ndarray):
     rgb = source_rgba[:, :, :3].astype(np.float32)
     gray = cv2.cvtColor(source_rgba[:, :, :3].astype(np.uint8), cv2.COLOR_RGB2GRAY)
@@ -1792,6 +1882,11 @@ def white_bg_brow_patch(source_rgba: np.ndarray, source_mask: np.ndarray, protec
     rgb_u8 = source_rgba[:, :, :3].astype(np.uint8)
     gray = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2GRAY).astype(np.float32)
     mask_float = np.clip(region_mask.astype(np.float32) / 255.0, 0.0, 1.0)
+    selected_gray = gray[mask_float > 0.03]
+    if selected_gray.size >= 20 and float(np.percentile(selected_gray, 65)) >= 248.0:
+        direct_rgb = rgb_u8.copy()
+        direct_rgb[painted_region_alpha <= 2] = 255
+        return crop_rgba_by_region(direct_rgb, painted_region_alpha, pad=24)
     h, w = gray.shape
     ksize = max(21, min(91, int(round(min(h, w) * 0.065)) | 1))
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
@@ -2158,6 +2253,19 @@ def load_path(req: PathRequest):
     if not path.exists() or not path.is_file():
         raise HTTPException(status_code=404, detail=f"文件不存在: {path}")
     return data_url_from_image(path)
+
+
+@app.post("/api/white_source")
+def white_source(req: WhiteSourceRequest):
+    source = np.array(decode_data_url(req.source_data))
+    result = Image.fromarray(white_background_line_art(source, req.protect_dark), "RGBA")
+    stem = re.sub(r"[\\/:*?\"<>|]+", "_", Path(req.source_name).stem).strip() or "source"
+    return {
+        "name": f"{stem}_white_bg.png",
+        "width": result.width,
+        "height": result.height,
+        "data_url": image_to_data_url(result),
+    }
 
 
 @app.post("/api/blend")
