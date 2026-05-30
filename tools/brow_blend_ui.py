@@ -284,8 +284,9 @@ HTML = r"""<!doctype html>
         </div>
         <div class="row" style="margin-top:8px;">
           <button class="ok" id="whiteSourceBtn">PS除底白底化选区</button>
-          <button id="restoreSourceBtn">还原来源</button>
+          <button class="ok" id="labAlphaPreviewBtn">Lab透明贴片预览</button>
         </div>
+        <button id="restoreSourceBtn" style="width:100%; margin-top:8px;">还原来源</button>
         <label>浏览器选择来源</label>
         <input id="sourceFile" type="file" accept="image/*" />
       </div>
@@ -409,6 +410,7 @@ HTML = r"""<!doctype html>
         <h2>贴片库</h2>
         <label>贴片模式</label>
         <select id="patchMode">
+          <option value="lab_alpha">Lab保边透明抠眉</option>
           <option value="white_bg">白底正片叠底素材</option>
           <option value="hair_only">只保留眉毛线条</option>
           <option value="soft_patch">带羽化皮肤过渡</option>
@@ -883,6 +885,18 @@ HTML = r"""<!doctype html>
       }
       loadImageData(sourceOriginalData, sourceOriginalName, 'source', { keepOriginal: true });
       setStatus('已还原来源图。');
+    };
+    document.getElementById('labAlphaPreviewBtn').onclick = () => {
+      if (!sourceImage) {
+        setStatus('请先载入来源图。');
+        return;
+      }
+      if (!getMaskBBox()) {
+        setStatus('先用画笔圈住眉毛区域，再预览 Lab 透明贴片。');
+        return;
+      }
+      document.getElementById('patchMode').value = 'lab_alpha';
+      exportPatch(false);
     };
     document.getElementById('whiteSourceBtn').onclick = async () => {
       if (!sourceImage) {
@@ -1868,6 +1882,103 @@ def selected_white_background_line_art(source_rgba: np.ndarray, source_mask: np.
     return line_art
 
 
+def lab_alpha_brow_patch(
+    source_rgba: np.ndarray,
+    source_mask: np.ndarray,
+    protect_dark: float,
+    feather: int,
+    contract: int,
+    pad: int,
+):
+    region_mask = make_patch_region_mask(source_mask, max(0, min(int(contract), 8)))
+    rgb_u8 = source_rgba[:, :, :3].astype(np.uint8)
+    lab = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2LAB).astype(np.float32)
+    l_channel = lab[:, :, 0]
+    a_channel = lab[:, :, 1]
+    b_channel = lab[:, :, 2]
+    mask_float = np.clip(region_mask.astype(np.float32) / 255.0, 0.0, 1.0)
+    inside = mask_float > 0.03
+    if np.count_nonzero(inside) < 20:
+        raise HTTPException(status_code=400, detail="来源选区太小，请多涂一点眉毛区域")
+
+    h, w = l_channel.shape
+    base = max(17, int(round(min(h, w) * 0.075)) | 1)
+    base = min(base, 121)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (base, base))
+    background_l = cv2.morphologyEx(l_channel.astype(np.uint8), cv2.MORPH_CLOSE, kernel).astype(np.float32)
+    background_l = cv2.GaussianBlur(
+        background_l,
+        (0, 0),
+        sigmaX=max(2.0, base / 6.0),
+        sigmaY=max(2.0, base / 6.0),
+    )
+    dark_detail = np.maximum(background_l - l_channel, 0.0)
+    selected_detail = dark_detail[inside]
+    selected_l = l_channel[inside]
+    if selected_detail.size < 20:
+        raise HTTPException(status_code=400, detail="来源选区太小，请多涂一点眉毛区域")
+
+    protect_dark = max(0.0, min(float(protect_dark), 1.0))
+    active = selected_detail[selected_detail > 0.5]
+    if active.size < 20:
+        active = selected_detail
+    low = max(2.0, float(np.percentile(active, 58.0 - 20.0 * protect_dark)))
+    high = max(low + 10.0, float(np.percentile(active, 94.0 - 8.0 * protect_dark)))
+    detail_alpha = smoothstep(low, high, dark_detail)
+
+    light_ref = float(np.percentile(selected_l, 72.0))
+    alpha = detail_alpha
+
+    skin_candidates = inside & (l_channel >= np.percentile(selected_l, 45.0)) & (dark_detail <= np.percentile(selected_detail, 62.0))
+    if np.count_nonzero(skin_candidates) < 20:
+        skin_candidates = inside & (l_channel >= np.percentile(selected_l, 55.0))
+    if np.count_nonzero(skin_candidates) >= 20:
+        skin_a = float(np.median(a_channel[skin_candidates]))
+        skin_b = float(np.median(b_channel[skin_candidates]))
+        chroma_dist = np.sqrt((a_channel - skin_a) ** 2 + (b_channel - skin_b) ** 2)
+        skin_like = chroma_dist < (5.0 + 7.0 * (1.0 - protect_dark))
+        not_deep_hair = (light_ref - l_channel) < (44.0 + 18.0 * protect_dark)
+        weak_detail = dark_detail < (high * 1.25)
+        alpha[skin_like & weak_detail & not_deep_hair] *= 0.08 + 0.22 * protect_dark
+
+    alpha *= mask_float
+    if feather > 0:
+        soft = max(0.35, min(float(feather), 30.0) / 20.0)
+        alpha = cv2.GaussianBlur(alpha.astype(np.float32), (0, 0), sigmaX=soft, sigmaY=soft)
+        alpha *= mask_float
+
+    alpha_u8 = np.clip(alpha * 255.0, 0, 255).astype(np.uint8)
+    low_cut = int(round(18 + 18 * (1.0 - protect_dark)))
+    alpha_u8[alpha_u8 < low_cut] = 0
+
+    core = alpha_u8 >= int(round(78 - 18 * protect_dark))
+    if np.count_nonzero(core) >= 10:
+        grow = max(3, int(round(min(h, w) * (0.028 + 0.022 * protect_dark))))
+        support_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (grow * 2 + 1, grow * 2 + 1))
+        support = cv2.dilate(core.astype(np.uint8), support_kernel, iterations=1).astype(bool)
+        alpha_u8[(alpha_u8 < int(round(70 + 35 * protect_dark))) & (~support)] = 0
+
+    out = source_rgba.copy()
+    visible = alpha_u8 > 0
+    if np.count_nonzero(visible) >= 20:
+        visible_alpha = alpha_u8[visible]
+        strong_cut = max(80.0, float(np.percentile(visible_alpha, 72)))
+        dark_cut = float(np.percentile(selected_l, 34.0))
+        hair_ref = visible & ((alpha_u8 >= strong_cut) | (l_channel <= dark_cut))
+        if np.count_nonzero(hair_ref) < 10:
+            hair_ref = visible
+        hair_color = np.median(rgb_u8[hair_ref].astype(np.float32), axis=0)
+        rgb = rgb_u8.astype(np.float32)
+        a_norm = np.clip(alpha_u8.astype(np.float32) / 255.0, 0.0, 1.0)
+        edge_cleanup = (1.0 - smoothstep(0.72, 0.98, a_norm)) * 0.68
+        edge_cleanup *= (alpha_u8 > 0).astype(np.float32)
+        clean_rgb = rgb * (1.0 - edge_cleanup[..., None]) + hair_color.reshape(1, 1, 3) * edge_cleanup[..., None]
+        out[:, :, :3] = np.clip(clean_rgb, 0, 255).astype(np.uint8)
+    out[:, :, 3] = alpha_u8
+    out[:, :, :3][alpha_u8 == 0] = 0
+    return crop_rgba_by_alpha(out, alpha_u8, pad=max(8, int(pad) + 12))
+
+
 def decontaminate_hair_patch(source_rgba: np.ndarray, alpha: np.ndarray):
     rgb = source_rgba[:, :, :3].astype(np.float32)
     gray = cv2.cvtColor(source_rgba[:, :, :3].astype(np.uint8), cv2.COLOR_RGB2GRAY)
@@ -2176,7 +2287,12 @@ def safe_patch_name(name: str, source_name: str, mode: str):
     if name:
         stem = Path(name).stem
     else:
-        mode_label = {"hair_only": "line", "soft_patch": "soft", "white_bg": "white_bg"}.get(mode, "patch")
+        mode_label = {
+            "lab_alpha": "lab_alpha",
+            "hair_only": "line",
+            "soft_patch": "soft",
+            "white_bg": "white_bg",
+        }.get(mode, "patch")
         stem = f"{Path(source_name).stem or 'source'}_brow_patch_{mode_label}_{time.strftime('%Y%m%d_%H%M%S')}"
     stem = re.sub(r"[\\/:*?\"<>|]+", "_", stem).strip() or "brow_patch"
     return stem + ".png"
@@ -2201,6 +2317,19 @@ def build_export_patch(req: ExportPatchRequest):
 
     if req.patch_mode == "white_bg":
         return Image.fromarray(white_bg_brow_patch(source, source_mask, req.protect_dark), "RGBA")
+
+    if req.patch_mode == "lab_alpha":
+        return Image.fromarray(
+            lab_alpha_brow_patch(
+                source,
+                source_mask,
+                req.protect_dark,
+                req.feather,
+                req.contract,
+                req.pad,
+            ),
+            "RGBA",
+        )
 
     if req.patch_mode == "soft_patch":
         adjusted_mask = make_protected_soft_patch_mask(
