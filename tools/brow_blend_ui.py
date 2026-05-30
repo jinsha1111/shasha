@@ -286,6 +286,7 @@ HTML = r"""<!doctype html>
           <button class="ok" id="whiteSourceBtn">PS除底白底化选区</button>
           <button class="ok" id="labAlphaPreviewBtn">Lab透明贴片预览</button>
         </div>
+        <button class="ok" id="hfAlphaPreviewBtn" style="width:100%; margin-top:8px;">高频毛流透明预览</button>
         <button id="restoreSourceBtn" style="width:100%; margin-top:8px;">还原来源</button>
         <label>浏览器选择来源</label>
         <input id="sourceFile" type="file" accept="image/*" />
@@ -410,6 +411,7 @@ HTML = r"""<!doctype html>
         <h2>贴片库</h2>
         <label>贴片模式</label>
         <select id="patchMode">
+          <option value="hf_alpha_v2">高频毛流透明抠眉 v2</option>
           <option value="lab_alpha">Lab保边透明抠眉</option>
           <option value="white_bg">白底正片叠底素材</option>
           <option value="hair_only">只保留眉毛线条</option>
@@ -896,6 +898,18 @@ HTML = r"""<!doctype html>
         return;
       }
       document.getElementById('patchMode').value = 'lab_alpha';
+      exportPatch(false);
+    };
+    document.getElementById('hfAlphaPreviewBtn').onclick = () => {
+      if (!sourceImage) {
+        setStatus('请先载入来源图。');
+        return;
+      }
+      if (!getMaskBBox()) {
+        setStatus('先用画笔圈住眉毛区域，再预览高频毛流透明贴片。');
+        return;
+      }
+      document.getElementById('patchMode').value = 'hf_alpha_v2';
       exportPatch(false);
     };
     document.getElementById('whiteSourceBtn').onclick = async () => {
@@ -1979,6 +1993,178 @@ def lab_alpha_brow_patch(
     return crop_rgba_by_alpha(out, alpha_u8, pad=max(8, int(pad) + 12))
 
 
+def line_kernel(length: int, angle_deg: float, thickness: int = 1):
+    length = max(3, int(length) | 1)
+    kernel = np.zeros((length, length), dtype=np.uint8)
+    center = length // 2
+    radius = center
+    rad = np.deg2rad(angle_deg)
+    dx = int(round(np.cos(rad) * radius))
+    dy = int(round(np.sin(rad) * radius))
+    cv2.line(kernel, (center - dx, center - dy), (center + dx, center + dy), 1, thickness=thickness)
+    if np.count_nonzero(kernel) == 0:
+        kernel[center, :] = 1
+    return kernel
+
+
+def directional_dark_line_response(l_channel: np.ndarray, region_mask: np.ndarray):
+    h, w = l_channel.shape
+    min_side = min(h, w)
+    lengths = sorted({max(7, int(round(min_side * factor)) | 1) for factor in (0.035, 0.055, 0.085)})
+    response = np.zeros_like(l_channel, dtype=np.float32)
+    l_u8 = l_channel.astype(np.uint8)
+    for length in lengths:
+        thickness = 1 if length < 19 else 2
+        for angle in range(0, 180, 15):
+            kernel = line_kernel(length, angle, thickness=thickness)
+            blackhat = cv2.morphologyEx(l_u8, cv2.MORPH_BLACKHAT, kernel).astype(np.float32)
+            response = np.maximum(response, blackhat)
+    response *= np.clip(region_mask.astype(np.float32) / 255.0, 0.0, 1.0)
+    return response
+
+
+def hf_alpha_brow_patch(
+    source_rgba: np.ndarray,
+    source_mask: np.ndarray,
+    protect_dark: float,
+    feather: int,
+    contract: int,
+    pad: int,
+):
+    region_mask = make_patch_region_mask(source_mask, max(0, min(int(contract), 6)))
+    rgb_u8 = source_rgba[:, :, :3].astype(np.uint8)
+    lab = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2LAB).astype(np.float32)
+    l_channel = lab[:, :, 0]
+    a_channel = lab[:, :, 1]
+    b_channel = lab[:, :, 2]
+    mask_float = np.clip(region_mask.astype(np.float32) / 255.0, 0.0, 1.0)
+    inside = mask_float > 0.03
+    if np.count_nonzero(inside) < 20:
+        raise HTTPException(status_code=400, detail="来源选区太小，请多涂一点眉毛区域")
+
+    protect_dark = max(0.0, min(float(protect_dark), 1.0))
+    h, w = l_channel.shape
+
+    base = max(21, int(round(min(h, w) * 0.105)) | 1)
+    base = min(base, 151)
+    bg_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (base, base))
+    background_l = cv2.morphologyEx(l_channel.astype(np.uint8), cv2.MORPH_CLOSE, bg_kernel).astype(np.float32)
+    background_l = cv2.GaussianBlur(
+        background_l,
+        (0, 0),
+        sigmaX=max(2.5, base / 6.0),
+        sigmaY=max(2.5, base / 6.0),
+    )
+    dark_detail = np.maximum(background_l - l_channel, 0.0) * mask_float
+    line_resp = directional_dark_line_response(l_channel, region_mask)
+    try:
+        from skimage.filters import frangi
+
+        vessel = frangi(
+            l_channel.astype(np.float32) / 255.0,
+            sigmas=[0.7, 1.1, 1.6, 2.2],
+            black_ridges=True,
+        )
+        vessel_resp = np.nan_to_num(vessel).astype(np.float32) * mask_float
+    except Exception:
+        vessel_resp = line_resp.copy()
+
+    selected_line = line_resp[inside]
+    selected_detail = dark_detail[inside]
+    selected_vessel = vessel_resp[inside]
+    selected_l = l_channel[inside]
+    if selected_detail.size < 20:
+        raise HTTPException(status_code=400, detail="来源选区太小，请多涂一点眉毛区域")
+
+    active_line = selected_line[selected_line > 0.5]
+    active_detail = selected_detail[selected_detail > 0.5]
+    active_vessel = selected_vessel[selected_vessel > 0]
+    if active_line.size < 20:
+        active_line = selected_detail
+    if active_detail.size < 20:
+        active_detail = selected_detail
+    if active_vessel.size < 20:
+        active_vessel = selected_vessel
+
+    line_low = max(1.5, float(np.percentile(active_line, 50.0 - 18.0 * protect_dark)))
+    line_high = max(line_low + 8.0, float(np.percentile(active_line, 92.0 - 8.0 * protect_dark)))
+    detail_low = max(2.0, float(np.percentile(active_detail, 68.0 - 24.0 * protect_dark)))
+    detail_high = max(detail_low + 10.0, float(np.percentile(active_detail, 96.0 - 8.0 * protect_dark)))
+    vessel_low = max(0.0005, float(np.percentile(active_vessel, 54.0 - 20.0 * protect_dark)))
+    vessel_high = max(vessel_low + 0.01, float(np.percentile(active_vessel, 97.0 - 8.0 * protect_dark)))
+
+    line_alpha = smoothstep(line_low, line_high, line_resp)
+    detail_alpha = smoothstep(detail_low, detail_high, dark_detail)
+    vessel_alpha = smoothstep(vessel_low, vessel_high, vessel_resp)
+    dark_gate = smoothstep(detail_low * 0.55, detail_high, dark_detail)
+
+    core = (
+        (vessel_alpha > (0.18 - 0.06 * protect_dark))
+        | ((line_alpha > (0.72 - 0.12 * protect_dark)) & (dark_gate > 0.25))
+    )
+    if np.count_nonzero(core) >= 10:
+        grow = max(4, int(round(min(h, w) * (0.030 + 0.020 * protect_dark))))
+        support_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (grow * 2 + 1, grow * 2 + 1))
+        support = cv2.dilate(core.astype(np.uint8), support_kernel, iterations=1).astype(bool)
+    else:
+        support = inside
+
+    alpha = vessel_alpha * (0.45 + 0.55 * dark_gate)
+    alpha = np.maximum(alpha, line_alpha * dark_gate * (0.18 + 0.18 * protect_dark))
+    alpha = np.maximum(alpha, detail_alpha * (0.08 + 0.20 * protect_dark) * support.astype(np.float32))
+
+    skin_candidates = inside & (l_channel >= np.percentile(selected_l, 48.0))
+    skin_candidates &= dark_detail <= np.percentile(selected_detail, 58.0)
+    if np.count_nonzero(skin_candidates) < 20:
+        skin_candidates = inside & (l_channel >= np.percentile(selected_l, 58.0))
+    if np.count_nonzero(skin_candidates) >= 20:
+        skin_a = float(np.median(a_channel[skin_candidates]))
+        skin_b = float(np.median(b_channel[skin_candidates]))
+        chroma_dist = np.sqrt((a_channel - skin_a) ** 2 + (b_channel - skin_b) ** 2)
+        skin_like = chroma_dist < (5.0 + 8.0 * (1.0 - protect_dark))
+        weak_line = line_alpha < (0.58 + 0.18 * protect_dark)
+        weak_detail = detail_alpha < (0.82 + 0.10 * protect_dark)
+        alpha[skin_like & weak_line & weak_detail] *= 0.02 + 0.12 * protect_dark
+
+    alpha *= mask_float
+    if feather > 0:
+        soft = max(0.25, min(float(feather), 26.0) / 24.0)
+        alpha = cv2.GaussianBlur(alpha.astype(np.float32), (0, 0), sigmaX=soft, sigmaY=soft)
+        alpha *= mask_float
+
+    alpha_u8 = np.clip(alpha * 255.0, 0, 255).astype(np.uint8)
+    low_cut = int(round(30 + 22 * (1.0 - protect_dark)))
+    alpha_u8[alpha_u8 < low_cut] = 0
+
+    strong = alpha_u8 >= int(round(80 - 18 * protect_dark))
+    if np.count_nonzero(strong) >= 10:
+        grow = max(4, int(round(min(h, w) * (0.035 + 0.018 * protect_dark))))
+        support_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (grow * 2 + 1, grow * 2 + 1))
+        support = cv2.dilate(strong.astype(np.uint8), support_kernel, iterations=1).astype(bool)
+        alpha_u8[(alpha_u8 < int(round(100 + 28 * protect_dark))) & (~support)] = 0
+
+    out = source_rgba.copy()
+    visible = alpha_u8 > 0
+    if np.count_nonzero(visible) >= 20:
+        strong_cut = max(96.0, float(np.percentile(alpha_u8[visible], 76)))
+        dark_cut = float(np.percentile(selected_l, 36.0))
+        hair_ref = visible & ((alpha_u8 >= strong_cut) | (l_channel <= dark_cut))
+        if np.count_nonzero(hair_ref) < 10:
+            hair_ref = visible
+        hair_color = np.median(rgb_u8[hair_ref].astype(np.float32), axis=0)
+        rgb = rgb_u8.astype(np.float32)
+        a_norm = np.clip(alpha_u8.astype(np.float32) / 255.0, 0.0, 1.0)
+        # Keep the original brow pixels. Only the almost-transparent fringe is nudged
+        # toward the sampled hair color to avoid pale skin halos in exported PNGs.
+        edge_cleanup = (1.0 - smoothstep(0.06, 0.36, a_norm)) * 0.18
+        edge_cleanup *= (alpha_u8 > 0).astype(np.float32)
+        clean_rgb = rgb * (1.0 - edge_cleanup[..., None]) + hair_color.reshape(1, 1, 3) * edge_cleanup[..., None]
+        out[:, :, :3] = np.clip(clean_rgb, 0, 255).astype(np.uint8)
+    out[:, :, 3] = alpha_u8
+    out[:, :, :3][alpha_u8 == 0] = 0
+    return crop_rgba_by_alpha(out, alpha_u8, pad=max(8, int(pad) + 12))
+
+
 def decontaminate_hair_patch(source_rgba: np.ndarray, alpha: np.ndarray):
     rgb = source_rgba[:, :, :3].astype(np.float32)
     gray = cv2.cvtColor(source_rgba[:, :, :3].astype(np.uint8), cv2.COLOR_RGB2GRAY)
@@ -2288,6 +2474,7 @@ def safe_patch_name(name: str, source_name: str, mode: str):
         stem = Path(name).stem
     else:
         mode_label = {
+            "hf_alpha_v2": "hf_alpha_v2",
             "lab_alpha": "lab_alpha",
             "hair_only": "line",
             "soft_patch": "soft",
@@ -2317,6 +2504,19 @@ def build_export_patch(req: ExportPatchRequest):
 
     if req.patch_mode == "white_bg":
         return Image.fromarray(white_bg_brow_patch(source, source_mask, req.protect_dark), "RGBA")
+
+    if req.patch_mode == "hf_alpha_v2":
+        return Image.fromarray(
+            hf_alpha_brow_patch(
+                source,
+                source_mask,
+                req.protect_dark,
+                req.feather,
+                req.contract,
+                req.pad,
+            ),
+            "RGBA",
+        )
 
     if req.patch_mode == "lab_alpha":
         return Image.fromarray(
